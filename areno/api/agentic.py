@@ -14,6 +14,7 @@ coverage can be added without changing trainer boundaries.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import logging
@@ -26,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from areno.api.multimodal import encode_multimodal_prompt
+from areno.api.multimodal import encode_multimodal_prompt, encode_processor_messages, modality_token_ids
 from areno.api.openai_chat import (
     build_chat_completion_response,
     first_user_text,
@@ -276,6 +277,8 @@ class RolloutSession:
         self._closing = False
         self._base_url = ""
         self._proxy_enabled = bool(proxy)
+        self._multimodal_encoding_cache: dict[str, tuple[list[int], dict[str, Any] | None]] = {}
+        self._multimodal_encoding_cache_limit = max(self._max_running_prompts * 2, 32)
 
     @property
     def max_running_prompts(self) -> int:
@@ -542,13 +545,27 @@ class RolloutSession:
 
     def _messages_to_tokens_and_features(self, pending: _PendingChat) -> tuple[list[int], dict[str, Any] | None]:
         tokenizer = self._trainer.get_tokenizer()
-        if _messages_have_images(pending.messages):
-            record = {
-                "messages": pending.messages,
-                "tools": pending.tools,
-                "images_base64": _message_images_base64(pending.messages),
-            }
-            return encode_multimodal_prompt(tokenizer, self._trainer.get_processor(), record)
+        if _messages_have_multimodal(pending.messages):
+            cache_key = _multimodal_encoding_cache_key(pending.messages, pending.tools)
+            cached = self._multimodal_encoding_cache.get(cache_key)
+            if cached is not None:
+                return list(cached[0]), cached[1]
+            processor = self._trainer.get_processor()
+            if processor is None:
+                raise ValueError("multimodal input requires a checkpoint processor")
+            if modality_token_ids(processor).keys() & {"audio", "video"}:
+                encoded = encode_processor_messages(processor, pending.messages, tools=pending.tools)
+            else:
+                record = {
+                    "messages": pending.messages,
+                    "tools": pending.tools,
+                    "images_base64": _message_images_base64(pending.messages),
+                }
+                encoded = encode_multimodal_prompt(tokenizer, processor, record)
+            if len(self._multimodal_encoding_cache) >= self._multimodal_encoding_cache_limit:
+                self._multimodal_encoding_cache.pop(next(iter(self._multimodal_encoding_cache)))
+            self._multimodal_encoding_cache[cache_key] = encoded
+            return list(encoded[0]), encoded[1]
         return (
             _messages_to_prompt_tokens(
                 tokenizer,
@@ -574,6 +591,13 @@ class RolloutSession:
         )
         if turn.input_tokens:
             pending.input_tokens = list(turn.input_tokens)
+            if _messages_have_multimodal(pending.messages):
+                encoded_tokens, pending.features = self._messages_to_tokens_and_features(pending)
+                if encoded_tokens != pending.input_tokens:
+                    raise ValueError(
+                        "multimodal trajectory tokens differ from the original rollout request; "
+                        "training cannot replay the sampled policy distribution"
+                    )
         else:
             pending.input_tokens, pending.features = self._messages_to_tokens_and_features(pending)
         return self._sample_from_pending_chat(
@@ -735,6 +759,11 @@ class RolloutSession:
         )
 
 
+def _multimodal_encoding_cache_key(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
+    payload = json.dumps([messages, tools], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def load_agent_run_fn(path: str) -> Callable[[RolloutSession, AgentBatch], Any]:
     """Load ``async def run_agent(ctx, batch)`` from a Python file."""
 
@@ -824,7 +853,7 @@ def _render_messages_for_display(tokenizer, messages: list[dict[str, Any]]) -> s
     """Render a message trajectory with the tokenizer chat template when available."""
 
     messages = _normalize_messages(messages)
-    if _messages_have_images(messages):
+    if _messages_have_multimodal(messages):
         return _messages_to_text(messages)
     if getattr(tokenizer, "chat_template", None):
         try:
@@ -883,7 +912,7 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _messages_to_text(messages: list[dict[str, Any]]) -> str:
-    if _messages_have_images(messages):
+    if _messages_have_multimodal(messages):
         parts = []
         for message in messages:
             content = message.get("content")
@@ -893,8 +922,10 @@ def _messages_to_text(messages: list[dict[str, Any]]) -> str:
                 for item in content:
                     if not isinstance(item, dict):
                         continue
-                    if item.get("type") in {"image", "image_url"}:
-                        parts.append("<image>")
+                    kind = str(item.get("type", ""))
+                    modality = kind.removesuffix("_url")
+                    if modality in {"image", "audio", "video"} or kind == "input_audio":
+                        parts.append(f"<{('audio' if kind == 'input_audio' else modality)}>")
                     elif item.get("type") == "text" and item.get("text") is not None:
                         parts.append(str(item["text"]))
         return "\n".join(parts)
@@ -907,6 +938,18 @@ def _first_user_text(messages: list[dict[str, Any]]) -> str:
 
 def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
     return any(_content_has_image(message.get("content")) for message in messages)
+
+
+def _messages_have_multimodal(messages: list[dict[str, Any]]) -> bool:
+    return any(_content_has_multimodal(message.get("content")) for message in messages)
+
+
+def _content_has_multimodal(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(item, dict)
+        and item.get("type") in {"image", "image_url", "audio", "audio_url", "input_audio", "video", "video_url"}
+        for item in content
+    )
 
 
 def _content_has_image(content: Any) -> bool:
