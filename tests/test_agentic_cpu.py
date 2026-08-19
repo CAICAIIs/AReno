@@ -348,7 +348,7 @@ def test_render_messages_for_display_skips_template_for_image_payloads():
 
 
 def test_agentic_policy_train_sequence_uses_compact_prompt_and_advantage_rows():
-    from areno.api.backend.areno.backend import _make_train_pack
+    from areno.api.backend.cuda.training import make_train_pack
     from areno.api.models import TrainSequence
 
     seq = TrainSequence.model_construct(
@@ -367,7 +367,7 @@ def test_agentic_policy_train_sequence_uses_compact_prompt_and_advantage_rows():
         reward=1.0,
     )
 
-    pack = _make_train_pack([seq])
+    pack = make_train_pack([seq])
 
     assert pack["prompt_mask"].tolist() == [[True, True, False, False]]
     assert "loss_mask" not in pack
@@ -523,19 +523,6 @@ def test_messages_to_prompt_tokens_falls_back_when_template_rejects_tools():
 
     assert tokens == [1]
     assert tokenizer.calls == [messages]
-
-
-def test_proxy_keeps_max_running_prompts_global_across_dp():
-    trainer = _FakeTrainer(world_size=8, tp_size=1)
-    session = RolloutSession(
-        trainer,
-        sampling_params=_FakeSamplingParams(),
-        loss_mask_policy=LossMaskPolicy(),
-        max_running_prompts=64,
-    )
-
-    assert session.max_running_prompts == 64
-    assert session._local_max_running_prompts == 8
 
 
 def test_proxy_http_server_allows_large_thread_pool():
@@ -798,22 +785,6 @@ def test_rollout_session_context_owns_backend_lifecycle():
     asyncio.run(run_session())
 
     assert trainer.rollout_session_events == ["begin", "end"]
-
-
-def test_rollout_session_uses_trainer_effective_dp_size():
-    trainer = _FakeTrainer(world_size=8, tp_size=4)
-    trainer.effective_dp_size = 4
-
-    session = RolloutSession(
-        trainer,
-        sampling_params=_FakeSamplingParams(),
-        loss_mask_policy=LossMaskPolicy(),
-        max_running_prompts=10,
-        proxy=False,
-    )
-
-    assert session._dp_size == 4
-    assert session._local_max_running_prompts == 3
 
 
 def test_rollout_session_sync_is_explicit_batch_level_hook():

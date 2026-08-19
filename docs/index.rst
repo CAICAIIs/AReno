@@ -15,6 +15,7 @@ AReno documentation
 
    Welcome <getting-started/welcome>
    getting-started/installation
+   Backends <getting-started/backends>
    getting-started/quickstart
 
 .. toctree::

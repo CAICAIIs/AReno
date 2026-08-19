@@ -459,7 +459,8 @@ class ConfigAndDataTest(unittest.TestCase):
         cfg = TrainerConfig(algo="sft", ckpt="unused", dataset_path="unused")
 
         self.assertTrue(cfg.keep_rollout_state)
-        self.assertTrue(cfg.areno_config().runtime["keep_rollout_state"])
+        self.assertTrue(cfg.cuda_config().runtime["keep_rollout_state"])
+        self.assertTrue(cfg.mlx_config().keep_rollout_state)
 
     def test_train_cli_drop_rollout_state_inverts_runtime_flag(self):
         """The public CLI exposes the memory-saving inverse of keep_rollout_state."""
@@ -468,6 +469,7 @@ class ConfigAndDataTest(unittest.TestCase):
         cfg = train_cli._trainer_config_from_args(args)
 
         self.assertFalse(cfg.keep_rollout_state)
+        self.assertFalse(cfg.mlx_config().keep_rollout_state)
 
     def test_train_cli_attn_backend_reaches_backend_runtime_config(self):
         """The train CLI attention backend flag should pass through SDK config."""
@@ -476,7 +478,7 @@ class ConfigAndDataTest(unittest.TestCase):
         cfg = train_cli._trainer_config_from_args(args)
 
         self.assertEqual(cfg.attn_backend, "native")
-        self.assertEqual(cfg.areno_config().runtime["attn_backend"], "native")
+        self.assertEqual(cfg.cuda_config().runtime["attn_backend"], "native")
 
     def test_to_device_and_to_cpu_walk_nested_containers(self):
         """Device helpers should preserve nested container structure."""
@@ -771,6 +773,7 @@ class ConfigAndDataTest(unittest.TestCase):
 def _train_args(**overrides):
     defaults = dict(
         algo="sft",
+        backend="cuda",
         ckpt="unused",
         dataset_path="unused",
         dataset_loader_fn=None,

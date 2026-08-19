@@ -11,6 +11,8 @@ The flow is:
        function), and runs the trainer to completion.
 """
 
+from __future__ import annotations
+
 import ast
 import importlib.util
 import json
@@ -20,6 +22,7 @@ import textwrap
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import click
 
@@ -33,11 +36,34 @@ from areno.api.trainer_config import (
     TrainerConfig,
 )
 from areno.cli.model_refs import resolve_model_refs_for_config
-from areno.engine.config import (
-    ModelConfig,
-    flash_attention_unsupported_gpu_reason,
-    flash_attention_unsupported_model_reason,
-)
+
+if TYPE_CHECKING:
+    from areno.engine.config import ModelConfig
+
+
+def config_from_hf(model_path: str):
+    """Load CUDA model config lazily while preserving the injectable CLI seam."""
+
+    from areno.models.registry import config_from_hf as load_config
+
+    return load_config(model_path)
+
+
+def flash_attention_unsupported_gpu_reason(devices):
+    """Resolve CUDA capability lazily so MLX-only imports do not require Torch."""
+
+    from areno.engine.config import flash_attention_unsupported_gpu_reason as resolve_reason
+
+    return resolve_reason(devices)
+
+
+def flash_attention_unsupported_model_reason(model_config):
+    """Resolve model attention support lazily so tests can replace the probe."""
+
+    from areno.engine.config import flash_attention_unsupported_model_reason as resolve_reason
+
+    return resolve_reason(model_config)
+
 
 # Group `areno train --help` flags by user intent rather than as one flat wall.
 # Each entry is (section title, option param names in display order). Every
@@ -187,6 +213,12 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
     """Build a typed trainer config from Click option values."""
 
     args = SimpleNamespace(**options)
+    backend = getattr(args, "backend", None)
+    if backend is None:
+        from areno.api.config import default_backend_type
+
+        backend = default_backend_type().value
+    args.backend = backend.lower()
     args.max_steps = getattr(args, "max_steps", None)
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
@@ -204,13 +236,23 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
     args.multimodal_projector_min_lr = getattr(args, "multimodal_projector_min_lr", None)
     args.multimodal_projector_lr_decay_steps = getattr(args, "multimodal_projector_lr_decay_steps", None)
     args.multimodal_projector_lr_decay_style = getattr(args, "multimodal_projector_lr_decay_style", None)
-    args.train_devices = _parse_cuda_devices(getattr(args, "train_devices", None), "--train-devices")
-    args.rollout_devices = _parse_cuda_devices(getattr(args, "rollout_devices", None), "--rollout-devices")
+    if args.backend == "mlx":
+        if args.train_devices is not None or args.rollout_devices is not None or args.rollout_tp_size is not None:
+            raise click.UsageError("MLX does not use CUDA device or rollout TP options")
+        if args.tp_size not in {1, 4} or args.world_size not in {1, 8}:
+            raise click.UsageError("MLX currently supports only one process and one device")
+        args.tp_size = 1
+        args.world_size = 1
+        args.train_devices = None
+        args.rollout_devices = None
+    else:
+        args.train_devices = _parse_cuda_devices(getattr(args, "train_devices", None), "--train-devices")
+        args.rollout_devices = _parse_cuda_devices(getattr(args, "rollout_devices", None), "--rollout-devices")
     if args.rollout_tp_size is not None and args.rollout_tp_size <= 0:
         raise click.UsageError("--rollout-tp-size must be positive")
-    if args.train_devices is not None:
+    if args.backend != "mlx" and args.train_devices is not None:
         args.world_size = len(args.train_devices)
-    else:
+    elif args.backend != "mlx":
         args.train_devices = list(range(args.world_size))
     if args.rollout_devices is None and args.rollout_tp_size is not None:
         args.rollout_devices = list(args.train_devices)
@@ -423,9 +465,15 @@ def _format_training_config_summary(
                 ("dp_size", _resolved_dp_size_for_summary(config)),
                 (
                     "devices",
-                    ",".join(str(device) for device in config.train_devices)
-                    if config.train_devices is not None
-                    else f"0..{config.world_size - 1}",
+                    (
+                        "Apple Metal"
+                        if config.backend == "mlx"
+                        else (
+                            ",".join(str(device) for device in config.train_devices)
+                            if config.train_devices is not None
+                            else f"0..{config.world_size - 1}"
+                        )
+                    ),
                 ),
                 ("attn_backend", attn_backend),
                 (
@@ -591,6 +639,8 @@ def _reward_ckpt_for_summary(config: TrainerConfig, reward_ckpt: str | None) -> 
 def _resolved_attn_backend_for_summary(
     config: TrainerConfig, *, model_config: ModelConfig | None = None
 ) -> tuple[str, str | None]:
+    if config.backend == "mlx":
+        return "mlx", None
     if config.attn_backend != "flash":
         return config.attn_backend, None
     reasons = [
@@ -613,11 +663,11 @@ def _resolved_attn_backend_for_summary(
 
 
 def _model_config_for_summary(config: TrainerConfig) -> ModelConfig | None:
+    if config.backend == "mlx":
+        return None
     if not Path(config.ckpt).exists():
         return None
     try:
-        from areno.models.registry import config_from_hf
-
         return config_from_hf(config.ckpt)
     except Exception:
         return None
@@ -721,6 +771,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
     # Each algorithm gets the narrowest config dataclass it needs; offline
     # trainers do not receive rollout/reward/GSPO fields by construction.
     args.max_steps = getattr(args, "max_steps", None)
+    args.backend = getattr(args, "backend", None)
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
     args.train_devices = getattr(args, "train_devices", None)
@@ -744,6 +795,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             algo=algorithm.name,
             ckpt=args.ckpt,
             dataset_path=args.dataset_path,
+            backend=args.backend,
             model_hub=args.model_hub,
             dataset_loader_fn=args.dataset_loader_fn,
             save_path=args.save_path,
@@ -796,6 +848,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             algo=algorithm.name,
             ckpt=args.ckpt,
             dataset_path=args.dataset_path,
+            backend=args.backend,
             model_hub=args.model_hub,
             dataset_loader_fn=args.dataset_loader_fn,
             save_path=args.save_path,
@@ -846,6 +899,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             algo=algorithm.name,
             ckpt=args.ckpt,
             dataset_path=args.dataset_path,
+            backend=args.backend,
             model_hub=args.model_hub,
             dataset_loader_fn=args.dataset_loader_fn,
             reward_fn_path=args.reward_fn_path,
@@ -907,6 +961,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         algo=algorithm.name,
         ckpt=args.ckpt,
         dataset_path=args.dataset_path,
+        backend=args.backend,
         model_hub=args.model_hub,
         dataset_loader_fn=args.dataset_loader_fn,
         reward_fn_path=args.reward_fn_path,
@@ -1000,9 +1055,9 @@ def run(trainer_config: TrainerConfig):
     api_trainer = areno.api.Trainer(
         trainer_config.world_size,
         trainer_config.ckpt,
-        backend_type=areno.api.Areno,
+        backend_type=trainer_config.backend_type(),
         metrics_log_dir=trainer_config.metrics_log_dir,
-        custom_config=trainer_config.areno_config(),
+        custom_config=trainer_config.backend_config(),
         score_micro_bs=trainer_config.score_micro_bs,
     )
     dataset = _load_dataset_for_training(
@@ -1494,7 +1549,11 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 @click.option("--adam-8bit", is_flag=True, help="Use 8-bit Adam moment states instead of FP32 Adam states.")
 @click.option("--unfreeze-mm-tower", "unfreeze_multimodal_tower", is_flag=True, help="Train multimodal encoder towers.")
 @click.option(
-    "--unfreeze-mm-projector", "unfreeze_multimodal_projector", is_flag=True, help="Train multimodal projectors."
+    "--unfreeze-mm-projector",
+    "--unfreeze-mm-merger",
+    "unfreeze_multimodal_projector",
+    is_flag=True,
+    help="Train multimodal projectors/mergers.",
 )
 @click.option(
     "--mm-tower-lr",
@@ -1516,27 +1575,35 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 )
 @click.option(
     "--mm-projector-lr",
+    "--mm-merger-lr",
     "multimodal_projector_lr",
     type=float,
     default=None,
-    help="Learning rate for unfrozen multimodal projectors; defaults to --lr.",
+    help="Learning rate for unfrozen multimodal projectors/mergers; defaults to --lr.",
 )
 @click.option(
-    "--mm-projector-min-lr", "multimodal_projector_min_lr", type=float, default=None, help="Projector minimum LR."
+    "--mm-projector-min-lr",
+    "--mm-merger-min-lr",
+    "multimodal_projector_min_lr",
+    type=float,
+    default=None,
+    help="Projector/merger minimum LR.",
 )
 @click.option(
     "--mm-projector-lr-steps",
+    "--mm-merger-lr-steps",
     "multimodal_projector_lr_decay_steps",
     type=int,
     default=None,
-    help="Projector LR decay steps.",
+    help="Projector/merger LR decay steps.",
 )
 @click.option(
     "--mm-projector-lr-style",
+    "--mm-merger-lr-style",
     "multimodal_projector_lr_decay_style",
     type=click.Choice(["constant", "linear", "cosine"]),
     default=None,
-    help="Projector LR decay style.",
+    help="Projector/merger LR decay style.",
 )
 @click.option("--weight-decay", type=float, default=1.0e-2, show_default=True, help="Policy optimizer weight decay.")
 @click.option("--grad-clip-norm", type=float, default=1.0, show_default=True, help="Policy gradient clipping norm.")
@@ -1549,7 +1616,7 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 @click.option(
     "--drop-rollout-state",
     is_flag=True,
-    help="Drop rollout state after each step to save GPU memory.",
+    help="Release completed rollout KV/cache state after each step.",
 )
 @click.option("--eager-decode", is_flag=True, help="Disable decode CUDA graph and run rollout decode eagerly.")
 @click.option(
