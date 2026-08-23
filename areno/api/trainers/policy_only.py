@@ -44,6 +44,12 @@ class _LogprobStats:
         self._count = 0
 
     def add(self, values) -> None:
+        # Sized inputs use the C-speed builtin sum; generator inputs (agentic
+        # loss-mask filters) fall back to a Python loop.
+        if hasattr(values, "__len__") and not isinstance(values, (str, bytes)):
+            self._sum += float(sum(values))
+            self._count += len(values)
+            return
         total = 0.0
         count = 0
         for value in values:
