@@ -20,7 +20,7 @@ import numpy as np
 
 from areno.api.advantages import compute_batch_group_advantages
 from areno.api.rewards import compute_group_advantages
-from areno.api.trainers.policy_only import _LogprobStats, _batch_decode, _rollout_logprob_mean
+from areno.api.trainers.policy_only import _batch_decode, _LogprobStats, _rollout_logprob_mean
 
 
 class _FakeTokenizerBase:

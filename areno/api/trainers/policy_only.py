@@ -569,9 +569,7 @@ class PolicyOnlyTrainer:
             advantage = advantages_by_row.get(row_idx, 0.0)
             effective_loss_mask = loss_mask if any(not item for item in loss_mask[prompt_len:]) else []
             if effective_loss_mask:
-                logprob_stats.add(
-                    lp for lp, is_loss in zip(logprobs, effective_loss_mask, strict=True) if is_loss
-                )
+                logprob_stats.add(lp for lp, is_loss in zip(logprobs, effective_loss_mask, strict=True) if is_loss)
             else:
                 logprob_stats.add(islice(logprobs, prompt_len, None))
             train_batch.append(
