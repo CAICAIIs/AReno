@@ -43,7 +43,7 @@ class _LogprobStats:
         self._sum = 0.0
         self._count = 0
 
-    def add(self, values) -> None:
+    def add(self, values: Any) -> None:
         # Sized inputs use the C-speed builtin sum; generator inputs (agentic
         # loss-mask filters) fall back to a Python loop.
         if hasattr(values, "__len__") and not isinstance(values, (str, bytes)):
@@ -66,7 +66,7 @@ class _LogprobStats:
         return self._count > 0
 
 
-def _batch_decode(tokenizer, token_lists):
+def _batch_decode(tokenizer: Any, token_lists: list[list[int]]) -> list[str]:
     """Decode every completion with one batched tokenizer call when supported.
 
     Falls back to per-completion ``tokenizer.decode`` for tokenizers without a
@@ -79,7 +79,7 @@ def _batch_decode(tokenizer, token_lists):
     return [tokenizer.decode(tokens) for tokens in token_lists]
 
 
-def _rollout_logprob_mean(value) -> float | None:
+def _rollout_logprob_mean(value: Any) -> float | None:
     """Return the mean of a rollout-logprob accumulator (list or stats).
 
     ``PPOTrainer`` overrides the batch assembly and still returns a plain
@@ -697,16 +697,16 @@ class PolicyOnlyTrainer:
         # One batched decode for the whole rollout batch instead of one
         # `tokenizer.decode` round trip per completion.
         all_resp_tokens: list[list[int]] = []
-        group_sizes: list[int] = []
         for item, result in zip(prompt_batch.items, rollout_results, strict=True):
-            group_sizes.append(len(result.sequences))
             all_resp_tokens.extend(seq.resp_tokens for seq in result.sequences)
         completions = _batch_decode(tokenizer, all_resp_tokens)
         completion_iter = iter(completions)
 
-        train_batch = []
-        rewards_all = []
-        logprob_stats = _LogprobStats()
+        # Pass 1: build and score reward records per prompt, collecting the
+        # per-sample rows and rewards in prompt-group order.
+        pending: list[tuple[Any, Any, list[int], list[float], list[bool], float]] = []
+        group_sizes: list[int] = []
+        all_rewards: list[float] = []
         for item_idx, (item, result) in enumerate(zip(prompt_batch.items, rollout_results, strict=True)):
             prefix_len = len(item.input_tokens)
             reward_records = []
@@ -732,30 +732,42 @@ class PolicyOnlyTrainer:
                 )
                 sample_rows.append((seq, tokens, logprobs, loss_mask))
             rewards = self._score_reward_records(reward_records)
-            rewards_all += rewards
-            # Group-relative advantage: A_i = (r_i - mean(r))/std(r); shared by
-            # every response token of sample i (vectorized over the batch).
-            advantages = compute_batch_group_advantages(rewards, [len(rewards)])
-            for (seq, tokens, logprobs, loss_mask), advantage, reward in zip(
-                sample_rows, advantages, rewards, strict=True
-            ):
-                resp_len = len(seq.resp_tokens)
-                logprob_stats.add(seq.resp_logprobs)
-                train_batch.append(
-                    areno.api.TrainSequence(
-                        # Prompt positions are masked (1=prompt, 0=response).
-                        prompt_mask=[1] * prefix_len + [0] * resp_len,
-                        tokens=tokens,
-                        # Rollout logprobs play the role of "old logprobs"; the
-                        # zero prefix keeps tensor lengths aligned with tokens.
-                        logprobs=logprobs,
-                        advantages=[0.0] * prefix_len + [advantage] * resp_len,
-                        features=item.record.get("features"),
-                        reward=reward,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
+            # Skip degenerate empty groups so advantage alignment stays intact.
+            if rewards:
+                group_sizes.append(len(rewards))
+                all_rewards.extend(rewards)
+            pending.extend(
+                (item, seq, tokens, logprobs, loss_mask, reward)
+                for (seq, tokens, logprobs, loss_mask), reward in zip(sample_rows, rewards, strict=True)
+            )
+
+        # Group-relative advantage: A_i = (r_i - mean(r))/std(r); shared by
+        # every response token of sample i. One vectorized pass over the whole
+        # batch using the prompt-group boundaries, instead of one numpy call
+        # per prompt group.
+        advantages = compute_batch_group_advantages(all_rewards, group_sizes)
+
+        train_batch = []
+        logprob_stats = _LogprobStats()
+        for (item, seq, tokens, logprobs, loss_mask, reward), advantage in zip(pending, advantages, strict=True):
+            prefix_len = len(item.input_tokens)
+            resp_len = len(seq.resp_tokens)
+            logprob_stats.add(seq.resp_logprobs)
+            train_batch.append(
+                areno.api.TrainSequence(
+                    # Prompt positions are masked (1=prompt, 0=response).
+                    prompt_mask=[1] * prefix_len + [0] * resp_len,
+                    tokens=tokens,
+                    # Rollout logprobs play the role of "old logprobs"; the
+                    # zero prefix keeps tensor lengths aligned with tokens.
+                    logprobs=logprobs,
+                    advantages=[0.0] * prefix_len + [advantage] * resp_len,
+                    features=item.record.get("features"),
+                    reward=reward,
+                    eos_token_id=tokenizer.eos_token_id,
                 )
-        return train_batch, rewards_all, logprob_stats
+            )
+        return train_batch, all_rewards, logprob_stats
 
     def _score_reward_records(self, records):
         from areno.api.rewards import score_reward_records

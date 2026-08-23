@@ -48,7 +48,7 @@ def compute_batch_group_advantages(
     group_sum = np.add.reduceat(rewards_arr, offsets)
     group_mean = group_sum / counts
     # Population standard deviation per group: sqrt(E[x^2] - E[x]^2).
-    group_sq_sum = np.add.reduceat(rewards_arr.astype(np.float32) ** 2, offsets)
+    group_sq_sum = np.add.reduceat(rewards_arr**2, offsets)
     group_std = np.sqrt(np.maximum(group_sq_sum / counts - group_mean**2, 0.0))
     means = np.repeat(group_mean, sizes)
     stds = np.repeat(group_std, sizes)
