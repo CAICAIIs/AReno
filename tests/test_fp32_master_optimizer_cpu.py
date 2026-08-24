@@ -98,6 +98,35 @@ def _gloo_sharded_optimizer_worker(rank: int, port: int, output_queue) -> None:
         dist.destroy_process_group()
 
 
+def _gloo_zero_length_optimizer_shard_worker(rank: int, port: int, optimizer_name: str, output_queue) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+        optimizer_cls = {"fp32": AdamWFP32Master, "8bit": AdamW8bit}[optimizer_name]
+        optimizer = optimizer_cls(
+            [parameter],
+            lr=1.0e-2,
+            betas=(0.0, 0.0),
+            weight_decay=0.0,
+            bucket_numel=1,
+            dp_rank=rank,
+            dp_size=2,
+            dp_group=dist.group.WORLD,
+        )
+        parameter.grad = torch.tensor([1.0 + rank], dtype=torch.bfloat16)
+        optimizer.reduce_scatter_gradients()
+        shard_numel = optimizer.buckets[0].shard_numel
+        optimizer.step()
+        output_queue.put((rank, shard_numel, parameter.detach().float().tolist()))
+    finally:
+        dist.destroy_process_group()
+
+
 def test_fp32_master_adamw_matches_torch_reference_across_buckets() -> None:
     initial = torch.linspace(-1.5, 1.5, 37, dtype=torch.float32).to(torch.bfloat16)
     candidate_param = torch.nn.Parameter(initial.clone())
@@ -236,7 +265,7 @@ def test_training_manager_offloads_optimizer_state_when_requested(
     optimizer_state_offload: str,
     expected_offloads: list[tuple[str, str | None]],
 ) -> None:
-    calls = {"events": [], "offload": []}
+    calls = {"events": [], "offload": [], "stream_gradient_shards": []}
 
     class _Optimizer:
         def configure_state_offload(self, *, mode: str, directory: str | None, batch_size: int) -> None:
@@ -274,7 +303,12 @@ def test_training_manager_offloads_optimizer_state_when_requested(
 
     worker._prepare_for_train = _prepare_for_train
     manager = TrainingManager(worker)
-    manager._train_step = lambda *_args, **_kwargs: {"ok": True}
+
+    def _train_step(*_args, **kwargs):
+        calls["stream_gradient_shards"].append(kwargs["stream_gradient_shards"])
+        return {"ok": True}
+
+    manager._train_step = _train_step
     payload = SimpleNamespace(data_packs_by_dp=[[{}]], gradient_accumulation_steps=1)
 
     assert manager.train(payload) == [{"ok": True}]
@@ -284,7 +318,27 @@ def test_training_manager_offloads_optimizer_state_when_requested(
     if optimizer_state_offload == "disk":
         expected_events.append(("prefetch",))
     expected_events.append(("zero_grad",))
-    assert calls == {"events": expected_events, "offload": expected_offloads}
+    assert calls == {
+        "events": expected_events,
+        "offload": expected_offloads,
+        "stream_gradient_shards": [optimizer_state_offload == "disk"],
+    }
+
+
+def test_training_manager_resident_gradient_accumulation_stays_fp32() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.bfloat16))
+    worker = SimpleNamespace(model=torch.nn.Module())
+    worker.model.register_parameter("weight", parameter)
+    manager = TrainingManager(worker)
+
+    parameter.grad = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
+    manager._accumulate_main_gradients()
+    parameter.grad = torch.tensor([0.75, 0.25], dtype=torch.bfloat16)
+    manager._accumulate_main_gradients()
+
+    assert parameter.grad is None
+    assert parameter.main_grad.dtype == torch.float32
+    torch.testing.assert_close(parameter.main_grad, torch.tensor([1.0, -0.25]))
 
 
 def test_fp32_master_disk_offload_is_lazy_and_preserves_next_update(tmp_path) -> None:
@@ -535,3 +589,31 @@ def test_real_gloo_dp_reduce_scatter_matches_averaged_reference() -> None:
     torch.testing.assert_close(joined_master, reference_param, rtol=2e-6, atol=2e-7)
     assert rank0_is_fp32 and rank1_is_fp32
     assert (rank0_shard_numel, rank1_shard_numel) == (9, 8)
+
+
+@pytest.mark.parametrize("optimizer_name", ["fp32", "8bit"])
+def test_real_gloo_dp_zero_length_shard_joins_parameter_gather(optimizer_name: str) -> None:
+    spawn = mp.get_context("spawn")
+    output_queue = spawn.Queue()
+    port = _free_port()
+    processes = [
+        spawn.Process(
+            target=_gloo_zero_length_optimizer_shard_worker,
+            args=(rank, port, optimizer_name, output_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    try:
+        results = dict((item[0], item[1:]) for item in (output_queue.get(timeout=20) for _ in processes))
+    finally:
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert all(process.exitcode == 0 for process in processes)
+    assert results[0][0] == 1
+    assert results[1][0] == 0
+    assert results[0][1] == results[1][1]
