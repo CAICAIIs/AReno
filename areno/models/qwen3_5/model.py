@@ -116,6 +116,7 @@ class Qwen35FullAttention(nn.Module):
                 "Qwen3.5 full attention requires num_key_value_heads to divide TP or TP to divide into replicated KV groups"
             )
         self.local_kv_heads = self.qkv_proj.local_out_features[1] // self.head_dim
+        self.replicated_kv = self.num_kv_heads < ctx.world_size
         self.o_proj = RowParallelLinear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
@@ -178,7 +179,12 @@ class Qwen35FullAttention(nn.Module):
         if self.k_cache.numel() == 0 or self.v_cache.numel() == 0:
             raise RuntimeError("Qwen3.5 full attention inference requires KV cache")
         if self.infer_backend is None:
-            self.infer_backend = build_infer_attention_backend(self.attn_backend)
+            # The automatic split-KV decode heuristic accumulates substantial
+            # rollout/train drift for the two-Q-head replicated-KV layout.
+            self.infer_backend = build_infer_attention_backend(
+                self.attn_backend,
+                decode_num_splits=1 if self.replicated_kv else None,
+            )
         return self.infer_backend(q, k, v, self.k_cache, self.v_cache, infer_meta)
 
     def set_kv_cache(self, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
@@ -541,21 +547,30 @@ class Qwen35MoeMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        moe_sequence_parallel = is_sequence_parallel_active()
+        sequence_parallel_hidden_states = hidden_states
+        if moe_sequence_parallel:
+            hidden_states = gather_from_sequence_parallel_region(hidden_states)
         batch, seqlen, hidden = hidden_states.shape
         flat = hidden_states.reshape(-1, hidden)
-        logits = _areno_linear_no_compile(flat.to(dtype=self.gate.dtype), self.gate)
-        log_once("qwen35_moe_topk_softmax", "using ARENO fused topk_softmax router for Qwen3.5-MoE")
-        topk_idx, topk_weight = _areno_topk_softmax_no_compile(logits, self.top_k, self.norm_topk_prob)
-        if self.training:
-            out = self.experts(flat, topk_idx.to(torch.long), topk_weight)
-        else:
-            out = self._forward_fused_moe(flat, topk_idx, topk_weight)
+        with sequence_parallel_region(False):
+            logits = _areno_linear_no_compile(flat.to(dtype=self.gate.dtype), self.gate)
+            log_once("qwen35_moe_topk_softmax", "using ARENO fused topk_softmax router for Qwen3.5-MoE")
+            topk_idx, topk_weight = _areno_topk_softmax_no_compile(logits, self.top_k, self.norm_topk_prob)
+            if self.training:
+                out = self.experts(flat, topk_idx.to(torch.long), topk_weight)
+            else:
+                out = self._forward_fused_moe(flat, topk_idx, topk_weight)
+        out = out.view(batch, seqlen, hidden)
+        if moe_sequence_parallel:
+            out = scatter_to_sequence_parallel_region(out)
         if self.shared_expert is not None:
-            shared = self.shared_expert(hidden_states)
+            shared_input = sequence_parallel_hidden_states if moe_sequence_parallel else hidden_states
+            shared = self.shared_expert(shared_input)
             if self.shared_expert_gate is not None:
-                shared = shared * torch.sigmoid(F.linear(hidden_states, self.shared_expert_gate.unsqueeze(0)))
-            out = out + shared.reshape(-1, hidden)
-        return out.view(batch, seqlen, hidden)
+                shared = shared * torch.sigmoid(F.linear(shared_input, self.shared_expert_gate.unsqueeze(0)))
+            out = out + shared
+        return out
 
     @torch.no_grad()
     def prepare_infer_weights(self) -> None:
@@ -1160,10 +1175,6 @@ class Qwen35ForCausalLM(nn.Module):
         use_sequence_parallel = bool(train_meta is not None and train_meta.sequence_parallel)
         if use_sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(hidden_states)
-            if position_ids.dim() == 3:
-                position_ids = scatter_to_sequence_parallel_region(position_ids.permute(1, 2, 0)).permute(2, 0, 1)
-            else:
-                position_ids = scatter_to_sequence_parallel_region(position_ids)
         with sequence_parallel_region(use_sequence_parallel):
             for layer in self.layers:
                 if getattr(layer, "handles_activation_checkpointing", False):

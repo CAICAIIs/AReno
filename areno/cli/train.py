@@ -94,6 +94,7 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "max_steps",
             "world_size",
             "tp_size",
+            "sequence_parallel",
             "train_devices",
         ),
     ),
@@ -226,6 +227,7 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
     args.train_devices = getattr(args, "train_devices", None)
+    args.sequence_parallel = getattr(args, "sequence_parallel", None)
     args.rollout_tp_size = getattr(args, "rollout_tp_size", None)
     args.rollout_devices = getattr(args, "rollout_devices", None)
     args.policy_sync_bucket_mb = getattr(args, "policy_sync_bucket_mb", 64)
@@ -493,6 +495,7 @@ def _format_training_config_summary(
             "Training",
             [
                 ("max_steps", _format_optional(config.max_steps)),
+                ("sequence_parallel", _sequence_parallel_for_summary(config, model_config)),
                 ("mini_bs", str(config.mini_bs)),
                 ("score_micro_bs", str(config.score_micro_bs)),
                 ("gradient_accumulation_steps", _format_optional(config.gradient_accumulation_steps, default="auto")),
@@ -690,6 +693,20 @@ def _resolved_dp_size_for_summary(config: TrainerConfig) -> str:
     return str(config.world_size // config.tp_size) if config.tp_size else "n/a"
 
 
+def _sequence_parallel_for_summary(config: TrainerConfig, model_config: ModelConfig | None) -> str:
+    if config.sequence_parallel is not None:
+        requested = bool(config.sequence_parallel)
+        source = "CLI"
+    elif model_config is not None:
+        requested = bool(model_config.sequence_parallel)
+        source = "model config"
+    else:
+        return "model config (resolved at load)"
+    enabled = requested and config.tp_size > 1
+    suffix = source if config.tp_size > 1 else f"{source}; disabled for TP1"
+    return f"{_format_bool(enabled)} ({suffix})"
+
+
 def _format_bool(value: bool) -> str:
     return "yes" if value else "no"
 
@@ -784,6 +801,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
     args.train_devices = getattr(args, "train_devices", None)
+    args.sequence_parallel = getattr(args, "sequence_parallel", None)
     args.rollout_tp_size = getattr(args, "rollout_tp_size", None)
     args.rollout_devices = getattr(args, "rollout_devices", None)
     args.policy_sync_bucket_mb = getattr(args, "policy_sync_bucket_mb", 64)
@@ -812,6 +830,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             epochs=args.epochs,
             max_steps=args.max_steps,
             tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
             world_size=args.world_size,
             train_devices=args.train_devices,
             batch_size=args.batch_size,
@@ -868,6 +887,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             epochs=args.epochs,
             max_steps=args.max_steps,
             tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
             world_size=args.world_size,
             train_devices=args.train_devices,
             batch_size=args.batch_size,
@@ -923,6 +943,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             epochs=args.epochs,
             max_steps=args.max_steps,
             tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
             world_size=args.world_size,
             train_devices=args.train_devices,
             rollout_tp_size=args.rollout_tp_size,
@@ -988,6 +1009,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         epochs=args.epochs,
         max_steps=args.max_steps,
         tp_size=args.tp_size,
+        sequence_parallel=args.sequence_parallel,
         world_size=args.world_size,
         train_devices=args.train_devices,
         rollout_tp_size=args.rollout_tp_size,
@@ -1145,6 +1167,7 @@ def _training_config_settings(config: TrainerConfig) -> dict:
             [
                 "world_size",
                 "tp_size",
+                "sequence_parallel",
                 "attn_backend",
                 "eager_decode",
                 "activation_checkpointing",
@@ -1498,6 +1521,11 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     default=4,
     show_default=True,
     help="Tensor parallel size for training.",
+)
+@click.option(
+    "--sequence-parallel/--no-sequence-parallel",
+    default=None,
+    help="Override checkpoint sequence_parallel; when omitted, use the model configuration.",
 )
 @click.option("--world-size", type=int, default=8, show_default=True, help="Total device count for the backend.")
 @click.option(

@@ -9,10 +9,11 @@ from areno.engine.config import EngineConfig
 from areno.engine.data import to_device
 from areno.engine.modeling import build_model_on_device, build_optimizer, canonical_model_path, param_grad, unwrap_model
 from areno.engine.optim import AdamW8bit, AdamWFP32Master
+from areno.engine.parallel.collectives import gather_from_sequence_parallel_region
 from areno.engine.parallel.context import get_tp_context
 from areno.engine.protocol import EnsureRolesPayload, ScorePayload, TrainValuesPayload
-from areno.engine.runtime.logprobs import next_token_logprobs
-from areno.engine.runtime.train_step import _dense_train_meta
+from areno.engine.runtime.logprobs import packed_next_token_logprobs
+from areno.engine.runtime.train_step import _pack_train_data, _train_meta
 from areno.models.registry import config_from_hf, load_model_weights
 
 _REWARD_HEAD_WEIGHT_KEYS = (
@@ -27,6 +28,19 @@ _REWARD_HEAD_WEIGHT_KEYS = (
     "model.reward_head.weight",
     "model.value_head.weight",
 )
+
+
+class _ScaleGradient(torch.autograd.Function):
+    """Keep forward values unchanged while scaling the input gradient."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad * ctx.scale, None
 
 
 def _reward_head_bias_key(weight_key: str) -> str:
@@ -141,6 +155,7 @@ class WorkerRole:
         model: torch.nn.Module,
         optimizer: AdamW8bit | AdamWFP32Master | None,
         value_head: torch.nn.Module | None,
+        sequence_parallel: bool = False,
         *,
         optimizer_offload_mode: str = "cpu",
         optimizer_offload_dir: str | None = None,
@@ -150,6 +165,7 @@ class WorkerRole:
         self.model = model
         self.optimizer = optimizer
         self.value_head = value_head
+        self.sequence_parallel = sequence_parallel
         self.optimizer_offload_mode = optimizer_offload_mode
         self.optimizer_offload_dir = optimizer_offload_dir
         self.optimizer_offload_batch_size = optimizer_offload_batch_size
@@ -166,6 +182,7 @@ class WorkerRole:
         optimizer_config,
         runtime_config,
         tp_size: int,
+        sequence_parallel: bool | None,
         dp_size: int,
         devices: list[int] | None,
         optimizer_lr: float | None = None,
@@ -181,6 +198,7 @@ class WorkerRole:
             optimizer=optimizer_config,
             runtime=runtime_config,
             tp_size=tp_size,
+            sequence_parallel=sequence_parallel,
             dp_size=dp_size,
             devices=devices,
             dummy_load=False,
@@ -223,6 +241,7 @@ class WorkerRole:
             model,
             optimizer,
             value_head,
+            role_config.effective_sequence_parallel,
             optimizer_offload_mode=str(offload_mode),
             optimizer_offload_dir=getattr(runtime_config, "optimizer_state_offload_dir", None),
             optimizer_offload_batch_size=int(getattr(runtime_config, "optimizer_state_offload_batch_size", 1)),
@@ -317,6 +336,7 @@ class RoleManager:
                 optimizer_config=worker.config.optimizer,
                 runtime_config=worker.config.runtime,
                 tp_size=worker.config.tp_size,
+                sequence_parallel=worker.config.sequence_parallel,
                 dp_size=int(worker.config.dp_size),
                 devices=worker.config.devices,
                 optimizer_lr=spec.optimizer_lr,
@@ -338,16 +358,28 @@ class RoleManager:
             worker._prepare_actor_for_inference()
             model = worker.model
             offload_role = None
+            sequence_parallel = worker.config.effective_sequence_parallel
         else:
             offload_role = self.roles[role_name]
             worker._prepare_actor_offloaded()
             offload_role.onload_for_inference(worker.device)
             model = offload_role.model
+            sequence_parallel = offload_role.sequence_parallel
         model.eval()
         try:
             token_rows = payload.token_rows_by_dp[ctx.dp_rank]
             features = payload.features_by_dp[ctx.dp_rank] if payload.features_by_dp is not None else None
-            local = [] if not token_rows else self._score_logprob_rows(model, token_rows, payload, features=features)
+            local = (
+                []
+                if not token_rows
+                else self._score_logprob_rows(
+                    model,
+                    token_rows,
+                    payload,
+                    features=features,
+                    sequence_parallel=sequence_parallel,
+                )
+            )
             return local if ctx.rank == 0 else None
         finally:
             if offload_role is not None:
@@ -360,6 +392,7 @@ class RoleManager:
         payload: ScorePayload,
         *,
         features: list[dict | None] | None = None,
+        sequence_parallel: bool,
     ) -> list[list[float]]:
         """Score token logprobs in bounded microbatches."""
 
@@ -368,16 +401,20 @@ class RoleManager:
         for start in range(0, len(token_rows), microbatch_size):
             rows = token_rows[start : start + microbatch_size]
             row_features = features[start : start + microbatch_size] if features is not None else None
-            tokens, lengths = _pad_token_rows(rows, self.worker.device, int(payload.pad_token_id))
+            data_pack, lengths = _pack_score_rows(
+                rows, self.worker.device, int(payload.pad_token_id), features=row_features
+            )
+            tokens = data_pack["input_ids"]
             model_kwargs = {
                 "input_ids": tokens,
-                "train_meta": _dense_train_meta(tokens, sequence_parallel_enabled=False),
+                "position_ids": data_pack["position_ids"],
+                "train_meta": _train_meta(data_pack, tokens, sequence_parallel=sequence_parallel),
             }
-            if row_features is not None and any(feature is not None for feature in row_features):
-                model_kwargs["features"] = row_features
+            if data_pack.get("features") is not None:
+                model_kwargs["features"] = data_pack["features"]
             out = model(**model_kwargs)
-            logprobs = next_token_logprobs(out.logits_shard, tokens)
-            local.extend(_unpad_action_rows(logprobs, lengths))
+            logprobs = packed_next_token_logprobs(out.logits_shard, tokens, data_pack["train_cu_seqlens"])
+            local.extend(_split_packed_action_rows(logprobs, lengths))
         return local
 
     @torch.inference_mode()
@@ -414,18 +451,23 @@ class RoleManager:
         for start in range(0, len(token_rows), microbatch_size):
             rows = token_rows[start : start + microbatch_size]
             row_features = features[start : start + microbatch_size] if features is not None else None
-            tokens, lengths = _pad_token_rows(rows, self.worker.device, int(payload.pad_token_id))
+            data_pack, lengths = _pack_score_rows(
+                rows, self.worker.device, int(payload.pad_token_id), features=row_features
+            )
+            tokens = data_pack["input_ids"]
             model_kwargs = {
                 "input_ids": tokens,
-                "train_meta": _dense_train_meta(tokens, sequence_parallel_enabled=False),
+                "position_ids": data_pack["position_ids"],
+                "train_meta": _train_meta(data_pack, tokens, sequence_parallel=role.sequence_parallel),
             }
-            if row_features is not None and any(feature is not None for feature in row_features):
-                model_kwargs["features"] = row_features
+            if data_pack.get("features") is not None:
+                model_kwargs["features"] = data_pack["features"]
             out = role.model(**model_kwargs)
             if out.hidden_states is None:
                 raise RuntimeError("critic model output must include hidden_states for value scoring")
-            values = role.value_head(out.hidden_states).squeeze(-1).float()
-            local.extend(_unpad_token_rows(values, lengths))
+            hidden_states = _gather_packed_hidden(out.hidden_states, model_kwargs["train_meta"])
+            values = role.value_head(hidden_states).squeeze(-1).float().reshape(-1)
+            local.extend(_split_packed_token_rows(values, lengths))
         return local
 
     @torch.inference_mode()
@@ -464,20 +506,25 @@ class RoleManager:
         for start in range(0, len(token_rows), microbatch_size):
             rows = token_rows[start : start + microbatch_size]
             row_features = features[start : start + microbatch_size] if features is not None else None
-            tokens, lengths = _pad_token_rows(rows, self.worker.device, int(payload.pad_token_id))
+            data_pack, lengths = _pack_score_rows(
+                rows, self.worker.device, int(payload.pad_token_id), features=row_features
+            )
+            tokens = data_pack["input_ids"]
             model_kwargs = {
                 "input_ids": tokens,
-                "train_meta": _dense_train_meta(tokens, sequence_parallel_enabled=False),
+                "position_ids": data_pack["position_ids"],
+                "train_meta": _train_meta(data_pack, tokens, sequence_parallel=role.sequence_parallel),
             }
-            if row_features is not None and any(feature is not None for feature in row_features):
-                model_kwargs["features"] = row_features
+            if data_pack.get("features") is not None:
+                model_kwargs["features"] = data_pack["features"]
             out = role.model(**model_kwargs)
             if out.hidden_states is None:
                 raise RuntimeError("reward model output must include hidden_states for reward scoring")
-            values = role.value_head(out.hidden_states).float()
+            hidden_states = _gather_packed_hidden(out.hidden_states, model_kwargs["train_meta"])
+            values = role.value_head(hidden_states).float()
             values = values.squeeze(-1) if values.shape[-1] == 1 else values[..., -1]
-            indices = torch.tensor([max(length - 1, 0) for length in lengths], device=values.device, dtype=torch.long)
-            rewards = values[torch.arange(values.shape[0], device=values.device), indices]
+            ends = data_pack["train_cu_seqlens"][1 : len(lengths) + 1].to(device=values.device, dtype=torch.long) - 1
+            rewards = values.reshape(-1).index_select(0, ends)
             local.extend(float(value) for value in rewards.detach().cpu().tolist())
         return local
 
@@ -518,25 +565,30 @@ class RoleManager:
         """Run one critic value microbatch and maybe step optimizer."""
 
         worker = self.worker
-        data_pack = to_device(data_pack_obj, worker.device)
+        data_pack = to_device(_pack_train_data(data_pack_obj), worker.device)
         tokens = data_pack["input_ids"].long()
-        prompt_mask = data_pack["prompt_mask"].bool()
-        returns = data_pack["returns"].float()
-        old_values = data_pack["values"].float()
-        out = role.model(input_ids=tokens)
+        train_meta = _train_meta(data_pack, tokens, sequence_parallel=role.sequence_parallel)
+        model_kwargs = {
+            "input_ids": tokens,
+            "position_ids": data_pack["position_ids"],
+            "train_meta": train_meta,
+        }
+        if data_pack.get("features") is not None:
+            model_kwargs["features"] = data_pack["features"]
+        out = role.model(**model_kwargs)
         if out.hidden_states is None:
             raise RuntimeError("critic model output must include hidden_states for value training")
-        values = role.value_head(out.hidden_states).squeeze(-1).float()
-        value_mask = _critic_value_mask(prompt_mask)
-        valid = value_mask & (tokens >= 0)
+        hidden_states = _gather_packed_hidden(out.hidden_states, train_meta)
+        token_values = role.value_head(hidden_states).squeeze(-1).float().reshape(-1)
+        action_positions = _packed_action_positions(tokens, data_pack["train_cu_seqlens"])
+        values = token_values.index_select(0, action_positions)
+        target = data_pack["packed_returns"].float()
+        baseline = data_pack["packed_values"].float()
+        valid = data_pack["packed_response_mask"].bool()
         if not bool(valid.any()):
             if allow_step:
                 self._maybe_step_role(role)
             return
-        target = torch.zeros_like(returns)
-        target[:, :-1] = returns[:, 1:]
-        baseline = torch.zeros_like(old_values)
-        baseline[:, :-1] = old_values[:, 1:]
         cliprange_value = float(payload.cliprange_value)
         value_loss_coef = float(payload.value_loss_coef)
         clipped = baseline + (values - baseline).clamp(min=-cliprange_value, max=cliprange_value)
@@ -620,22 +672,77 @@ def _pad_token_rows(
     return tokens, lengths
 
 
-def _unpad_action_rows(logprobs: torch.Tensor, lengths: list[int]) -> list[list[float]]:
-    """Slice action-token logprobs out of a padded `(B, T)` tensor."""
+def _pack_score_rows(
+    token_rows: list[list[int]],
+    device: torch.device,
+    pad_token_id: int,
+    *,
+    features: list[dict | None] | None = None,
+) -> tuple[dict, list[int]]:
+    """Build the same canonical packed representation used by training."""
+
+    tokens, lengths = _pad_token_rows(token_rows, device, pad_token_id)
+    shape = tokens.shape
+    data_pack = {
+        "input_ids": tokens,
+        "lengths": torch.tensor(lengths, device=device, dtype=torch.long),
+        "prompt_mask": torch.ones(shape, device=device, dtype=torch.bool),
+        "advantages": torch.zeros(shape, device=device, dtype=torch.float32),
+        "logprobs": torch.zeros(shape, device=device, dtype=torch.float32),
+    }
+    if features is not None:
+        data_pack["features"] = features
+    return _pack_train_data(data_pack), lengths
+
+
+def _split_packed_action_rows(logprobs: torch.Tensor, lengths: list[int]) -> list[list[float]]:
+    """Split flat packed action logprobs and restore the leading token value."""
 
     rows = []
-    for row_idx, length in enumerate(lengths):
+    offset = 0
+    for length in lengths:
         values = [0.0]
         if length > 1:
-            values.extend(logprobs[row_idx, : length - 1].detach().cpu().tolist())
+            count = length - 1
+            values.extend(logprobs[offset : offset + count].detach().cpu().tolist())
+            offset += count
         rows.append(values)
     return rows
 
 
-def _unpad_token_rows(values: torch.Tensor, lengths: list[int]) -> list[list[float]]:
-    """Slice per-token scalar values out of a padded `(B, T)` tensor."""
+def _split_packed_token_rows(values: torch.Tensor, lengths: list[int]) -> list[list[float]]:
+    """Split flat packed token values while omitting TP-alignment sequences."""
 
-    return [values[row_idx, :length].detach().cpu().tolist() for row_idx, length in enumerate(lengths)]
+    rows = []
+    offset = 0
+    for length in lengths:
+        rows.append(values[offset : offset + length].detach().cpu().tolist())
+        offset += length
+    return rows
+
+
+def _gather_packed_hidden(hidden_states: torch.Tensor, train_meta) -> torch.Tensor:
+    """Materialize the full packed token axis for replicated scalar heads."""
+
+    if train_meta.sequence_parallel:
+        hidden_states = gather_from_sequence_parallel_region(hidden_states)
+        # Every TP rank applies the same replicated scalar head and therefore
+        # contributes the same full-sequence hidden gradient. The gather's
+        # backward reduce-scatter sums those copies, so average only the
+        # gradient crossing back into the TP backbone. Value-head parameter
+        # gradients remain unscaled and are averaged by `_sync_role_grads`.
+        world_size = get_tp_context().world_size
+        return _ScaleGradient.apply(hidden_states, 1.0 / world_size)
+    return hidden_states
+
+
+def _packed_action_positions(tokens: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Return packed token positions whose hidden states predict actions."""
+
+    positions = torch.arange(tokens.numel(), device=tokens.device)
+    keep = torch.ones(tokens.numel(), device=tokens.device, dtype=torch.bool)
+    keep[cu_seqlens.to(device=tokens.device, dtype=torch.long)[1:] - 1] = False
+    return positions[keep]
 
 
 def _score_microbatch_size(value: int) -> int:

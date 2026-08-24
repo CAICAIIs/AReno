@@ -30,8 +30,8 @@ from areno.engine.layers.attention_backend.common import (
     require_flash_attention_supported,
 )
 from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, _native_prefill
-from areno.engine.layers.attention_backend.train import _native_train_areno
-from areno.engine.runtime.metadata import InferMeta
+from areno.engine.layers.attention_backend.train import _native_train, _native_train_areno
+from areno.engine.runtime.metadata import InferMeta, TrainMeta
 from areno.engine.training import _actor_train_model
 
 
@@ -115,6 +115,19 @@ class ConfigAndDataTest(unittest.TestCase):
         self.assertEqual(captured["window_left"], 31)
         self.assertEqual(captured["softmax_scale"], 1.0)
 
+    def test_native_sdpa_supports_packed_sequence_parallel_metadata(self):
+        q = torch.randn(1, 8, 2, 4)
+        k = torch.randn(1, 8, 1, 4)
+        v = torch.randn(1, 8, 1, 4)
+        cu_seqlens = torch.tensor([0, 3, 7, 8], dtype=torch.int32)
+        non_sp = TrainMeta(cu_seqlens=cu_seqlens, max_seqlen=4, packed=True, sequence_parallel=False)
+        sp = TrainMeta(cu_seqlens=cu_seqlens, max_seqlen=4, packed=True, sequence_parallel=True)
+
+        expected = _native_train(q, k, v, non_sp, (-1, -1), None)
+        actual = _native_train(q, k, v, sp, (-1, -1), None)
+
+        torch.testing.assert_close(actual, expected)
+
     def test_native_train_rollout_matching_is_opt_in(self):
         from areno.engine.layers.attention_backend.train import build_train_attention_backend
 
@@ -166,6 +179,25 @@ class ConfigAndDataTest(unittest.TestCase):
         cfg = EngineConfig(model=model, tp_size=2, devices=[0, 1, 2, 3])
 
         self.assertEqual(cfg.dp_size, 2)
+
+    def test_engine_config_resolves_sequence_parallel_override_before_model_config(self):
+        model = ModelConfig(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=16,
+            vocab_size=32,
+            sequence_parallel=False,
+        )
+
+        inherited = EngineConfig(model=model, tp_size=2, devices=[0, 1])
+        self.assertFalse(inherited.effective_sequence_parallel)
+
+        overridden = EngineConfig(model=model, tp_size=2, devices=[0, 1], sequence_parallel=True)
+        self.assertTrue(overridden.model.sequence_parallel)
+        self.assertTrue(overridden.effective_sequence_parallel)
+
+        tp1 = EngineConfig(model=model, tp_size=1, devices=[0], sequence_parallel=True)
+        self.assertFalse(tp1.effective_sequence_parallel)
 
     def test_runtime_config_attn_backend_propagates_to_model_config(self):
         """The runtime attention backend should reach model layer construction."""
@@ -424,6 +456,11 @@ class ConfigAndDataTest(unittest.TestCase):
         with patch.dict(sys.modules, {"flash_attn": None}):
             build_train_attention_backend("native")
             build_infer_attention_backend("native")
+
+    def test_attention_backend_can_force_decode_num_splits(self):
+        backend = FlashAttnInferBackend("flash", decode_num_splits=1)
+
+        self.assertEqual(backend.decode_num_splits, 1)
 
     def test_rollout_config_defaults_max_running_prompts_to_flat_batch(self):
         """Rollout concurrency defaults to batch_size * n_samples, not per-DP."""

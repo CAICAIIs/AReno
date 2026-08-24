@@ -85,7 +85,6 @@ from areno.engine.parallel.collectives import (
     copy_to_tensor_parallel_region,
     gather_from_sequence_parallel_region,
     is_sequence_parallel_active,
-    reduce_scatter_to_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
     sequence_parallel_region,
 )
@@ -175,7 +174,9 @@ class BailingGate(nn.Module):
         self.register_buffer("local_expert_bias", torch.zeros(self.num_experts), persistent=False)
 
     @torch._dynamo.disable
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, hidden_states: torch.Tensor, num_padding_tokens: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = hidden_states.view(-1, hidden_states.shape[-1])
         # Promote to router_dtype (typically fp32) for numerical stability of
         # the sigmoid/top-k selection.
@@ -183,7 +184,8 @@ class BailingGate(nn.Module):
         topk_idx, topk_weight = self._forward_grouped_topk(logits)
         if torch.is_grad_enabled():
             # Only track load when training; eval calls keep counters cold.
-            _accumulate_tokens_per_expert(self.local_tokens_per_expert, topk_idx, self.num_experts)
+            routed_tokens = topk_idx[:-num_padding_tokens] if num_padding_tokens else topk_idx
+            _accumulate_tokens_per_expert(self.local_tokens_per_expert, routed_tokens, self.num_experts)
         return topk_idx, topk_weight.float(), logits
 
     @torch._dynamo.disable
@@ -275,30 +277,30 @@ class BailingSparseMoeBlock(nn.Module):
             routed_scaling_factor=self.config.routed_scaling_factor,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, num_padding_tokens: int = 0) -> torch.Tensor:
         # In SP mode we need the full (un-scattered) hidden states for routing
         # since the router weight isn't sharded along the sequence dim.
         moe_sequence_parallel = is_sequence_parallel_active()
+        sequence_parallel_hidden_states = hidden_states
         if moe_sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(hidden_states)
-        identity = hidden_states
         bsz, seqlen, hidden = hidden_states.shape
         expert_input = hidden_states.to(dtype=self.experts.linear_fc1.weight.dtype)
         with sequence_parallel_region(False):
-            topk_idx, topk_weight, _ = self.gate(hidden_states)
+            topk_idx, topk_weight, _ = self.gate(hidden_states, num_padding_tokens)
             flat = expert_input.view(-1, hidden)
             if self.training:
                 # Permute/unpermute path is autograd-friendly.
                 out = self.experts(flat, topk_idx, topk_weight).view(bsz, seqlen, hidden)
-                if self.shared_experts is not None:
-                    out = out + self.shared_experts(identity)
-                return reduce_scatter_to_sequence_parallel_region(out) if moe_sequence_parallel else out
-            # Inference: fused-MoE kernel over the stacked w1/w2 weights.
-            out = self._forward_fused_moe(flat, topk_idx, topk_weight)
-        out = out.view(bsz, seqlen, hidden)
+            else:
+                # Inference: fused-MoE kernel over the stacked w1/w2 weights.
+                out = self._forward_fused_moe(flat, topk_idx, topk_weight).view(bsz, seqlen, hidden)
+        if moe_sequence_parallel:
+            out = scatter_to_sequence_parallel_region(out)
         if self.shared_experts is not None:
-            out = out + self.shared_experts(identity)
-        return reduce_scatter_to_sequence_parallel_region(out) if moe_sequence_parallel else out
+            shared_input = sequence_parallel_hidden_states if moe_sequence_parallel else hidden_states
+            out = out + self.shared_experts(shared_input)
+        return out
 
     @torch.no_grad()
     def prepare_infer_weights(self) -> None:
@@ -780,8 +782,8 @@ class BailingSoftmaxAttention(nn.Module):
         infer_meta: InferMeta | None,
     ) -> torch.Tensor:
         hidden_states = hidden_states.to(dtype=self.dense.weight.dtype)
-        bsz, seqlen, _ = hidden_states.shape
         q, k, v = self._project(hidden_states, position_ids)
+        bsz, seqlen = q.shape[:2]
         if infer_meta is not None:
             # Lazily build the inference backend so weight-only training paths
             # don't pay the cost.
@@ -798,14 +800,13 @@ class BailingSoftmaxAttention(nn.Module):
     def _project(
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, seqlen, _ = hidden_states.shape
         if self.kv_lora_rank is None:
             # Standard GQA path: split fused QKV, optional per-head norm, rope
             # on the trailing qk_rope_head_dim channels only.
             assert self.query_key_value is not None
-            qkv = self.query_key_value(hidden_states).view(
-                bsz, seqlen, self.local_heads + 2 * self.local_kv_heads, self.head_dim
-            )
+            qkv = self.query_key_value(hidden_states)
+            bsz, seqlen = qkv.shape[:2]
+            qkv = qkv.view(bsz, seqlen, self.local_heads + 2 * self.local_kv_heads, self.head_dim)
             q, k, v = qkv.split([self.local_heads, self.local_kv_heads, self.local_kv_heads], dim=-2)
             if self.query_layernorm is not None:
                 q = self.query_layernorm(q)
@@ -823,15 +824,17 @@ class BailingSoftmaxAttention(nn.Module):
         mla_input = hidden_states if is_sequence_parallel_active() else copy_to_tensor_parallel_region(hidden_states)
         if self.q_lora_rank is None:
             assert self.q_proj is not None
-            q = self.q_proj(mla_input).view(bsz, seqlen, self.local_heads, self.head_dim)
+            q = self.q_proj(mla_input)
         else:
             assert self.q_a_proj is not None and self.q_a_layernorm is not None and self.q_b_proj is not None
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(mla_input))).view(
-                bsz, seqlen, self.local_heads, self.head_dim
-            )
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(mla_input)))
+        bsz, seqlen = q.shape[:2]
+        q = q.view(bsz, seqlen, self.local_heads, self.head_dim)
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a = self.kv_a_proj_with_mqa(mla_input)
         compressed_kv, k_rope = kv_a.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        if is_sequence_parallel_active():
+            k_rope = gather_from_sequence_parallel_region(k_rope)
         kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
             bsz, seqlen, self.local_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -942,8 +945,8 @@ class BailingLinearAttention(nn.Module):
         train_meta: TrainMeta | None,
         infer_meta: InferMeta | None,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = hidden_states.shape
         qkv = self.query_key_value(hidden_states)
+        bsz, seqlen = qkv.shape[:2]
         if self.linear_silu:
             qkv = _areno_silu_no_compile(qkv)
         qkv = qkv.view(bsz, seqlen, 3 * self.local_heads, self.head_dim)
@@ -1162,10 +1165,10 @@ class BailingKDAAttention(nn.Module):
     ) -> torch.Tensor:
         del position_ids
         hidden_states = hidden_states.to(dtype=self.q_proj.weight.dtype)
-        batch, seqlen, _ = hidden_states.shape
         q = self._causal_conv(self.q_proj(hidden_states), self.q_conv1d_weight, 0, train_meta, infer_meta)
         k = self._causal_conv(self.k_proj(hidden_states), self.k_conv1d_weight, 1, train_meta, infer_meta)
         v = self._causal_conv(self.v_proj(hidden_states), self.v_conv1d_weight, 2, train_meta, infer_meta)
+        batch, seqlen = q.shape[:2]
         q = q.to(dtype=hidden_states.dtype)
         k = k.to(dtype=hidden_states.dtype)
         v = v.to(dtype=hidden_states.dtype)
@@ -1412,7 +1415,11 @@ class BailingDecoderLayer(nn.Module):
             self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta
         )
         residual = hidden_states
-        return residual + self.mlp(self.post_attention_layernorm(hidden_states))
+        mlp_input = self.post_attention_layernorm(hidden_states)
+        if isinstance(self.mlp, BailingSparseMoeBlock):
+            num_padding_tokens = train_meta.num_padding_tokens if train_meta is not None else 0
+            return residual + self.mlp(mlp_input, num_padding_tokens)
+        return residual + self.mlp(mlp_input)
 
 
 class BailingMoeV3ForCausalLM(nn.Module):
