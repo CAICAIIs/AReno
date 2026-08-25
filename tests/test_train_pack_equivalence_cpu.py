@@ -55,20 +55,20 @@ def _build_list_rows(rng, n=8, prefix=40, resp=400):
     return rows
 
 
-def _build_scalar_rows(rng, n=8, prefix=40, resp=400):
-    """Same logical content with the structured prompt_len/scalar_advantage layout."""
+def _build_scalar_rows_from(list_rows):
+    """Derive scalar-layout rows from list-layout rows (identical content)."""
 
     rows = []
-    for _ in range(n):
-        resp_len = resp + rng.randint(-20, 20)
+    for row in list_rows:
+        prefix_len = sum(1 for is_prompt in row.prompt_mask if is_prompt)
         rows.append(
             TrainSequence(
-                prompt_len=prefix,
-                tokens=list(range(prefix + resp_len)),
-                logprobs=[0.0] * prefix + [rng.random() - 0.5 for _ in range(resp_len)],
-                scalar_advantage=float(rng.random()),
-                reward=float(rng.random()),
-                eos_token_id=0,
+                prompt_len=prefix_len,
+                tokens=list(row.tokens),
+                logprobs=list(row.logprobs),
+                scalar_advantage=float(row.advantages[prefix_len]),
+                reward=row.reward,
+                eos_token_id=row.eos_token_id,
             )
         )
     return rows
@@ -95,8 +95,8 @@ class PadRowsVectorizationTest(unittest.TestCase):
     def test_bool_rows(self):
         rng = random.Random(2)
         rows = [[bool(rng.getrandbits(1)) for _ in range(rng.randint(0, 30))] for _ in range(9)]
-        a = pad_rows(rows, dtype=torch.bool, fill_value=True, width=28)
-        b = _reference_pad_rows(rows, dtype=torch.bool, fill_value=True, width=28)
+        a = pad_rows(rows, dtype=torch.bool, fill_value=True, width=32)
+        b = _reference_pad_rows(rows, dtype=torch.bool, fill_value=True, width=32)
         self.assertTrue(torch.equal(a, b), "bool pad_rows mismatch")
 
     def test_all_empty_rows(self):
@@ -120,11 +120,7 @@ class TrainPackEquivalenceTest(unittest.TestCase):
     def test_grpo_shaped_packs_identical(self):
         rng = random.Random(3)
         list_rows = _build_list_rows(rng)
-        rng2 = random.Random(3)
-        scalar_rows = _build_scalar_rows(rng2)
-        # Mirror the list rows' rewards into the scalar rows so reward fields match.
-        for row, list_row in zip(scalar_rows, list_rows, strict=True):
-            row.reward = list_row.reward
+        scalar_rows = _build_scalar_rows_from(list_rows)
         self._assert_packs_equal(make_train_pack(list_rows), make_train_pack(scalar_rows))
 
     def test_scalar_pack_semantics(self):
@@ -141,7 +137,7 @@ class TrainPackEquivalenceTest(unittest.TestCase):
         pack = make_train_pack([seq])
         self.assertEqual(pack["prompt_mask"].tolist(), [[True, True, True, False, False, False]])
         self.assertEqual(pack["advantages"].tolist(), [[0.0, 0.0, 0.0, 0.25, 0.25, 0.25]])
-        self.assertEqual(pack["loss_mask"], None)
+        self.assertIsNone(pack.get("loss_mask"))
 
 
 class TrainBatchStatsEquivalenceTest(unittest.TestCase):
@@ -150,10 +146,7 @@ class TrainBatchStatsEquivalenceTest(unittest.TestCase):
     def test_stats_identical(self):
         rng = random.Random(4)
         list_rows = _build_list_rows(rng, n=6, prefix=10, resp=50)
-        rng2 = random.Random(4)
-        scalar_rows = _build_scalar_rows(rng2, n=6, prefix=10, resp=50)
-        for row, list_row in zip(scalar_rows, list_rows, strict=True):
-            row.reward = list_row.reward
+        scalar_rows = _build_scalar_rows_from(list_rows)
         list_stats = collect_train_batch_stats(list_rows)
         scalar_stats = collect_train_batch_stats(scalar_rows)
         self.assertEqual(list_stats.keys(), scalar_stats.keys())

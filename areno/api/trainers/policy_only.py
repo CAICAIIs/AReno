@@ -752,7 +752,6 @@ class PolicyOnlyTrainer:
         logprob_stats = _LogprobStats()
         for (item, seq, tokens, logprobs, reward), advantage in zip(pending, advantages, strict=True):
             prefix_len = len(item.input_tokens)
-            resp_len = len(seq.resp_tokens)
             logprob_stats.add(seq.resp_logprobs)
             train_batch.append(
                 areno.api.TrainSequence(
