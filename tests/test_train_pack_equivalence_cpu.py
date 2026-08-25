@@ -37,17 +37,23 @@ def _reference_pad_rows(rows, *, dtype, fill_value=0, width=None):
 
 
 def _build_list_rows(rng, n=8, prefix=40, resp=400):
-    """GRPO-shaped rows with the legacy full-list layout."""
+    """GRPO-shaped rows with the legacy full-list layout.
+
+    Advantages are constant per sample and broadcast over the response tokens,
+    matching what the policy-only trainer produces; the scalar layout
+    expresses exactly this invariant.
+    """
 
     rows = []
     for _ in range(n):
         resp_len = resp + rng.randint(-20, 20)
+        advantage = rng.random()
         rows.append(
             TrainSequence(
                 prompt_mask=[True] * prefix + [False] * resp_len,
                 tokens=list(range(prefix + resp_len)),
                 logprobs=[0.0] * prefix + [rng.random() - 0.5 for _ in range(resp_len)],
-                advantages=[0.0] * prefix + [rng.random() for _ in range(resp_len)],
+                advantages=[0.0] * prefix + [advantage] * resp_len,
                 reward=float(rng.random()),
                 eos_token_id=0,
             )
