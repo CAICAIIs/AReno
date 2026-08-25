@@ -235,9 +235,39 @@ class ClusterCallHandle:
         return self._pending.results
 
 
-def find_free_port() -> int:
-    """Reserve an available localhost TCP port for torch distributed init."""
+_FREE_PORT_EXCLUSIONS: set[int] = set()
+# Fixed range outside the kernel ephemeral range (32768-60999 on Linux) so a
+# just-released reservation cannot be re-taken as the source port of an
+# outbound connection, which would leave the port in TIME-WAIT and fail the
+# later TCPStore server bind with EADDRINUSE (see #517).
+_FREE_PORT_MIN = 20000
+_FREE_PORT_MAX = 30000
 
+
+def find_free_port() -> int:
+    """Reserve an available localhost TCP port for torch distributed init.
+
+    Ports are probed with a real bind from a fixed non-ephemeral range (which
+    also excludes listeners and TIME-WAIT sockets on that address), and
+    consecutive calls in one process never return the same port, so the train
+    and rollout clusters cannot collide at TCPStore bind time.
+    """
+
+    import random as _random
+
+    for _ in range(128):
+        port = _random.randint(_FREE_PORT_MIN, _FREE_PORT_MAX)
+        if port in _FREE_PORT_EXCLUSIONS:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue  # listener or TIME-WAIT socket already on this port
+        _FREE_PORT_EXCLUSIONS.add(port)
+        return port
+    # Fall back to the kernel ephemeral allocator if the fixed range is
+    # exhausted (unexpected on any real host).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])

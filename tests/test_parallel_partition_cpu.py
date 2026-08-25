@@ -145,3 +145,22 @@ def test_real_gloo_tp_broadcast_uses_partition_global_root() -> None:
         2: "rollout-root",
         3: "rollout-root",
     }
+
+
+def test_find_free_port_returns_distinct_bindable_ports() -> None:
+    """Consecutive calls return distinct, immediately bindable ports.
+
+    The port must come from the fixed non-ephemeral range and be re-bindable
+    right away; ephemeral-range ports can be stolen by outbound traffic after
+    the probe closes, which fails the later TCPStore bind with EADDRINUSE
+    (#517).
+    """
+
+    import socket
+
+    ports = [find_free_port() for _ in range(8)]
+    assert len(set(ports)) == len(ports), f"duplicate ports returned: {ports}"
+    for port in ports:
+        assert 20000 <= port < 30000, f"port {port} outside the fixed range"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
