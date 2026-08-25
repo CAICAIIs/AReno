@@ -15,6 +15,7 @@ to the matching public method.
 
 from __future__ import annotations
 
+import os
 import queue
 
 import torch
@@ -27,7 +28,13 @@ from areno.engine.config import EngineConfig
 from areno.engine.data import RolloutOutput
 from areno.engine.data.sampling import _truncate_generated
 from areno.engine.inference import InferCacheSpec, InferenceManager
-from areno.engine.modeling import build_model_on_device, build_optimizer, configure_multimodal_training, param_grad
+from areno.engine.modeling import (
+    build_model_on_device,
+    build_optimizer,
+    configure_multimodal_training,
+    param_grad,
+    quantize_model_weights_fp8,
+)
 from areno.engine.parallel.context import get_tp_context
 from areno.engine.policy_sync import policy_plan_metadata, transfer_policy_weights
 from areno.engine.protocol import (
@@ -65,6 +72,17 @@ class ArenoWorker:
         self.model = build_model_on_device(config, self.device)
         if config.model_path is not None and not config.dummy_load:
             load_model_weights(self.model, config.model, config.model_path)
+        if config.model.quant_method == "fp8" or os.environ.get("ARENO_QUANT_FP8"):
+            # Decode-only FP8 quantization (RFC 0001): the FP8 W8A16 kernel has no
+            # backward, so it cannot update a model in a training step. Guard against
+            # silently running a train loop with zero gradient.
+            if config.role == "train":
+                raise RuntimeError(
+                    "quant_method='fp8' (decode-only) cannot be used in a train worker: "
+                    "the FP8 kernel has no backward. Use quant_method='none' for training "
+                    "or run the rollout/inference role."
+                )
+            quantize_model_weights_fp8(self.model)
         configure_multimodal_training(self.model, config.optimizer, trainable=config.role == "train")
         self.adapter_registry = (
             initialize_lora(self.model, config.lora, seed=config.lora_seed) if config.lora is not None else None

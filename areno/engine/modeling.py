@@ -20,6 +20,31 @@ def param_grad(param: torch.nn.Parameter) -> torch.Tensor | None:
     return param.grad
 
 
+def quantize_model_weights_fp8(model: torch.nn.Module) -> int:
+    """Mark every TP-parallel linear weight as FP8 for the decode path.
+
+    Calls ``mark_fp8_weight`` on the weight of each column/merged/row-parallel
+    linear so ``_areno_linear_forward`` routes those through the FP8 W8A16
+    kernel (RFC 0001). Decode/inference-only — the Triton FP8 kernel has no
+    backward, so this must not be used in a training step. Returns the count.
+    """
+    from areno.accel.kernels.fp8_linear import mark_fp8_weight
+    from areno.engine.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+
+    count = 0
+    for module in model.modules():
+        if isinstance(module, (ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear)):
+            weight = getattr(module, "weight", None)
+            if weight is not None and getattr(weight, "ndim", 0) == 2 and weight.numel() > 0 and weight.is_cuda:
+                mark_fp8_weight(weight)
+                count += 1
+    if count:
+        import logging
+
+        logging.getLogger("areno").warning("FP8 quantized %d linear weights (decode path)", count)
+    return count
+
+
 def build_model_on_device(config: EngineConfig, device: torch.device) -> torch.nn.Module:
     """Construct the model directly on `device` under the configured dtype."""
 

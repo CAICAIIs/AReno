@@ -65,6 +65,7 @@ def _cuda_extensions():
                 "areno/accel/csrc/conv.cu",
                 "areno/accel/csrc/embedding.cu",
                 "areno/accel/csrc/linear.cu",
+                "areno/accel/csrc/e4m3_linear.cu",
                 "areno/accel/csrc/moe_align_kernel.cu",
                 "areno/accel/csrc/moe_permute.cu",
                 "areno/accel/csrc/normalization.cu",
