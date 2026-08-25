@@ -683,9 +683,12 @@ class PolicyOnlyTrainer:
         avoids per-token Python churn: completions are decoded with one batched
         tokenizer call, per-sample prefix/response lists are built once and
         reused for both the reward record and the ``TrainSequence``, advantages
-        are computed in one vectorized pass over the batch, and rollout-logprob
+        are computed in one vectorized pass over the batch, rollout-logprob
         statistics are amortized instead of materializing one float per
-        response token.
+        response token, and the structured prompt/advantage layout
+        (``prompt_len`` + ``scalar_advantage``) lets the pack helpers derive
+        the prompt mask and per-token advantage tensors with vectorized fast
+        paths instead of per-token lists.
         """
 
         import areno.api
@@ -702,7 +705,7 @@ class PolicyOnlyTrainer:
 
         # Pass 1: build and score reward records per prompt, collecting the
         # per-sample rows and rewards in prompt-group order.
-        pending: list[tuple[Any, Any, list[int], list[float], list[bool], float]] = []
+        pending: list[tuple[Any, Any, list[int], list[float], float]] = []
         group_sizes: list[int] = []
         all_rewards: list[float] = []
         for item_idx, (item, result) in enumerate(zip(prompt_batch.items, rollout_results, strict=True)):
@@ -735,7 +738,7 @@ class PolicyOnlyTrainer:
                 group_sizes.append(len(rewards))
                 all_rewards.extend(rewards)
             pending.extend(
-                (item, seq, tokens, logprobs, loss_mask, reward)
+                (item, seq, tokens, logprobs, reward)
                 for (seq, tokens, logprobs, loss_mask), reward in zip(sample_rows, rewards, strict=True)
             )
 
@@ -747,19 +750,22 @@ class PolicyOnlyTrainer:
 
         train_batch = []
         logprob_stats = _LogprobStats()
-        for (item, seq, tokens, logprobs, loss_mask, reward), advantage in zip(pending, advantages, strict=True):
+        for (item, seq, tokens, logprobs, reward), advantage in zip(pending, advantages, strict=True):
             prefix_len = len(item.input_tokens)
             resp_len = len(seq.resp_tokens)
             logprob_stats.add(seq.resp_logprobs)
             train_batch.append(
                 areno.api.TrainSequence(
-                    # Prompt positions are masked (1=prompt, 0=response).
-                    prompt_mask=[1] * prefix_len + [0] * resp_len,
                     tokens=tokens,
                     # Rollout logprobs play the role of "old logprobs"; the
                     # zero prefix keeps tensor lengths aligned with tokens.
                     logprobs=logprobs,
-                    advantages=[0.0] * prefix_len + [advantage] * resp_len,
+                    # Structured prompt/advantage layout: the pack helpers
+                    # derive the prompt mask and per-token advantage tensors
+                    # from these scalars with vectorized fast paths, avoiding
+                    # per-token list construction for every response position.
+                    prompt_len=prefix_len,
+                    scalar_advantage=float(advantage),
                     features=item.record.get("features"),
                     reward=reward,
                     eos_token_id=tokenizer.eos_token_id,
