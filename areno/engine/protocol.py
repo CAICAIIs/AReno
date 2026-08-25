@@ -236,10 +236,14 @@ class ClusterCallHandle:
 
 
 _FREE_PORT_EXCLUSIONS: set[int] = set()
+_FREE_PORT_EXCLUSIONS_LOCK = threading.Lock()
 # Fixed range outside the kernel ephemeral range (32768-60999 on Linux) so a
 # just-released reservation cannot be re-taken as the source port of an
 # outbound connection, which would leave the port in TIME-WAIT and fail the
-# later TCPStore server bind with EADDRINUSE (see #517).
+# later TCPStore server bind with EADDRINUSE (see #517). Half-open [20000,
+# 30000); hosts that widen ip_local_port_range beyond this range are not
+# covered by the outbound-reuse argument, but the bind probe still rejects
+# occupied ports at selection time.
 _FREE_PORT_MIN = 20000
 _FREE_PORT_MAX = 30000
 
@@ -248,15 +252,16 @@ def find_free_port() -> int:
     """Reserve an available localhost TCP port for torch distributed init.
 
     Ports are probed with a real bind from a fixed non-ephemeral range (which
-    also excludes listeners and TIME-WAIT sockets on that address), and
-    consecutive calls in one process never return the same port, so the train
-    and rollout clusters cannot collide at TCPStore bind time.
+    also rejects listeners, including wildcard listeners, and TIME-WAIT
+    sockets on the probe address), and consecutive calls in one process never
+    return the same port, so the train and rollout clusters cannot collide at
+    TCPStore bind time.
     """
 
     import random as _random
 
     for _ in range(128):
-        port = _random.randint(_FREE_PORT_MIN, _FREE_PORT_MAX)
+        port = _random.randint(_FREE_PORT_MIN, _FREE_PORT_MAX - 1)
         if port in _FREE_PORT_EXCLUSIONS:
             continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -264,7 +269,8 @@ def find_free_port() -> int:
                 sock.bind(("127.0.0.1", port))
             except OSError:
                 continue  # listener or TIME-WAIT socket already on this port
-        _FREE_PORT_EXCLUSIONS.add(port)
+        with _FREE_PORT_EXCLUSIONS_LOCK:
+            _FREE_PORT_EXCLUSIONS.add(port)
         return port
     # Fall back to the kernel ephemeral allocator if the fixed range is
     # exhausted (unexpected on any real host).
