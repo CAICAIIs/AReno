@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import multiprocessing as mp
 
+import pytest
 import torch
 
 from areno.engine.parallel import context
 from areno.engine.parallel.collectives import broadcast_object
-from areno.engine.protocol import find_free_port
+from areno.engine.protocol import _create_rendezvous_store
 
 
 def _run_offset_tp_broadcast(global_rank: int, port: int, output_queue) -> None:
@@ -127,7 +128,10 @@ def test_single_engine_context_creates_no_policy_publisher_group(monkeypatch) ->
 def test_real_gloo_tp_broadcast_uses_partition_global_root() -> None:
     spawn = mp.get_context("spawn")
     output_queue = spawn.Queue()
-    port = find_free_port()
+    # The coordinator holds the server store (port=0) so the resolved port is
+    # genuinely reserved before the workers join as client stores.
+    store = _create_rendezvous_store("127.0.0.1", 4)
+    port = int(store.port)
     processes = [
         spawn.Process(target=_run_offset_tp_broadcast, args=(global_rank, port, output_queue))
         for global_rank in range(4)
@@ -147,20 +151,25 @@ def test_real_gloo_tp_broadcast_uses_partition_global_root() -> None:
     }
 
 
-def test_find_free_port_returns_distinct_bindable_ports() -> None:
-    """Consecutive calls return distinct, immediately bindable ports.
+def test_rendezvous_store_resolves_and_holds_its_port() -> None:
+    """The coordinator store resolves a real port and keeps it bound.
 
-    The port must come from the fixed non-ephemeral range and be re-bindable
-    right away; ephemeral-range ports can be stolen by outbound traffic after
-    the probe closes, which fails the later TCPStore bind with EADDRINUSE
-    (#517).
+    The resolved port must be immediately usable by client stores, and binding
+    the same port again must fail while the server store is alive (the socket
+    is genuinely reserved, unlike the old bind-close-bind probe, #517).
     """
 
     import socket
 
-    ports = [find_free_port() for _ in range(8)]
-    assert len(set(ports)) == len(ports), f"duplicate ports returned: {ports}"
-    for port in ports:
-        assert 20000 <= port < 30000, f"port {port} outside the fixed range"
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    import torch.distributed as dist
+
+    store = _create_rendezvous_store("127.0.0.1", 2)
+    port = int(store.port)
+    assert port > 0
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(OSError):
             sock.bind(("127.0.0.1", port))
+    # A client store connects to the retained server.
+    client = dist.TCPStore("127.0.0.1", port, world_size=2, is_master=False)
+    store.set("k", "v")
+    assert client.get("k") == b"v"
