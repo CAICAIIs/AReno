@@ -183,6 +183,24 @@ class ConfigAndDataTest(unittest.TestCase):
 
         self.assertEqual(cfg.dp_size, 2)
 
+    def test_engine_config_only_keeps_routing_replay_for_moe_models(self):
+        """Dense models retain their original path when rollout trainers request R3."""
+        dense_runtime = RuntimeConfig(rollout_routing_replay=True)
+        dense = ModelConfig(num_attention_heads=4, num_key_value_heads=4, intermediate_size=16, vocab_size=32)
+        EngineConfig(model=dense, devices=[0], runtime=dense_runtime)
+        self.assertFalse(dense_runtime.rollout_routing_replay)
+
+        moe_runtime = RuntimeConfig(rollout_routing_replay=True)
+        moe = ModelConfig(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=16,
+            vocab_size=32,
+            num_experts=8,
+        )
+        EngineConfig(model=moe, devices=[0], runtime=moe_runtime)
+        self.assertTrue(moe_runtime.rollout_routing_replay)
+
     def test_engine_config_resolves_sequence_parallel_override_before_model_config(self):
         model = ModelConfig(
             num_attention_heads=4,
@@ -608,6 +626,7 @@ class ConfigAndDataTest(unittest.TestCase):
         )
 
         self.assertEqual(cfg.resolved_max_running_prompts(), 256)
+        self.assertTrue(cfg.cuda_config().runtime["rollout_routing_replay"])
 
     def test_rollout_config_respects_explicit_max_running_prompts(self):
         """An explicit max_running_prompts value should pass through unchanged."""

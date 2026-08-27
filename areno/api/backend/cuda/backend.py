@@ -359,7 +359,11 @@ class CudaBackend(Backend):
         # Repack the flat result into per-prompt groups of `n_samples`
         # completions so downstream code can iterate `for item, result`.
         sequences = [
-            RolloutSequence(resp_tokens=tokens, resp_logprobs=rollout.logprobs[index, : len(tokens)].tolist())
+            RolloutSequence(
+                resp_tokens=tokens,
+                resp_logprobs=rollout.logprobs[index, : len(tokens)].tolist(),
+                routed_experts=(rollout.routed_experts[index] if rollout.routed_experts is not None else None),
+            )
             for index, tokens in enumerate(rollout.response_ids)
         ]
         return group_rollout_sequences(
@@ -468,7 +472,11 @@ class CudaBackend(Backend):
             sampling_params=options["sampling_params"],
         )
         sequences = [
-            RolloutSequence(resp_tokens=tokens, resp_logprobs=rollout.logprobs[index, : len(tokens)].tolist())
+            RolloutSequence(
+                resp_tokens=tokens,
+                resp_logprobs=rollout.logprobs[index, : len(tokens)].tolist(),
+                routed_experts=(rollout.routed_experts[index] if rollout.routed_experts is not None else None),
+            )
             for index, tokens in enumerate(rollout.response_ids)
         ]
         return group_rollout_sequences(
@@ -568,16 +576,20 @@ class CudaBackend(Backend):
         token_rows: list[list[int]],
         *,
         features: list[dict | None] | None = None,
+        routed_experts: list[object] | None = None,
         microbatch_size: int = 8,
     ) -> list[list[float]]:
         engine = self._require_train_engine()
         if features is not None and len(features) != len(token_rows):
             raise ValueError("features must have the same length as token_rows")
+        if routed_experts is not None and len(routed_experts) != len(token_rows):
+            raise ValueError("routed_experts must have the same length as token_rows")
         return engine.score_logprobs(
             role,
             token_rows,
             pad_token_id=pad_token_id(ctx),
             features=features,
+            routed_experts=routed_experts,
             microbatch_size=microbatch_size,
         )
 
@@ -614,7 +626,7 @@ class CudaBackend(Backend):
         # value loss path that takes (cliprange_value, value_loss_coef)).
         packs = []
         for start in range(0, len(batch_data), mini_bs):
-            packs.append(make_train_pack(batch_data[start : start + mini_bs]))
+            packs.append(make_train_pack(batch_data[start : start + mini_bs], include_routing_replay=False))
         return engine.train_values(
             role,
             packs,

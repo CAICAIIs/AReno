@@ -83,7 +83,10 @@ def _merge_dp_rollouts_by_prompt_indices(
 
     if total_count == 0:
         return _merge_rollouts([])
-    rows: list[tuple[list[int], list[int], str, torch.Tensor] | None] = [None for _ in range(total_count)]
+    routed_experts = [] if any(output is not None and output.routed_experts is not None for output in outputs) else None
+    rows: list[tuple[list[int], list[int], str, torch.Tensor, torch.Tensor | None] | None] = [
+        None for _ in range(total_count)
+    ]
     for dp_rank, output in enumerate(outputs):
         if output is None:
             continue
@@ -97,11 +100,17 @@ def _merge_dp_rollouts_by_prompt_indices(
             if row_idx < 0 or row_idx >= total_count:
                 raise RuntimeError(f"DP rollout prompt index out of chunk range: original_idx={original_idx}")
             response = output.response_ids[local_idx]
+            routes = None
+            if routed_experts is not None:
+                if output.routed_experts is None:
+                    raise RuntimeError("routing replay is missing from one DP rollout shard")
+                routes = output.routed_experts[local_idx]
             rows[row_idx] = (
                 output.prompt_ids[local_idx],
                 response,
                 output.finish_reason[local_idx],
                 output.logprobs[local_idx, : len(response)].detach().cpu(),
+                routes,
             )
     if any(row is None for row in rows):
         missing = [idx for idx, row in enumerate(rows) if row is None]
@@ -114,6 +123,7 @@ def _merge_dp_rollouts_by_prompt_indices(
         [row[3] for row in materialized],
         metrics=None,
         adapter_version=_rollout_version(non_empty=[output for output in outputs if output is not None]),
+        routed_experts=[row[4] for row in materialized if row[4] is not None] if routed_experts is not None else None,
     )
 
 
@@ -587,6 +597,7 @@ class ArenoEngine:
         *,
         pad_token_id: int,
         features: list[dict[str, Any] | None] | None = None,
+        routed_experts: list[object] | None = None,
         microbatch_size: int = 8,
     ) -> list[list[float]]:
         """Score fixed token rows with a model role.
@@ -600,6 +611,8 @@ class ArenoEngine:
             return []
         if features is not None and len(features) != len(token_rows):
             raise ValueError("features must have the same length as token_rows")
+        if routed_experts is not None and len(routed_experts) != len(token_rows):
+            raise ValueError("routed_experts must have the same length as token_rows")
         results = self.cluster.call(
             Op.SCORE_LOGPROBS,
             ScorePayload(
@@ -607,6 +620,9 @@ class ArenoEngine:
                 token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
                 features_by_dp=split_list_by_dp(features, int(self.config.dp_size)) if features is not None else None,
                 pad_token_id=int(pad_token_id),
+                routing_replay_by_dp=(
+                    split_list_by_dp(routed_experts, int(self.config.dp_size)) if routed_experts is not None else None
+                ),
                 microbatch_size=int(microbatch_size),
             ),
         )

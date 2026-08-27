@@ -64,6 +64,7 @@ class RuntimeConfig:
     optimizer_state_offload_dir: str | None = None
     optimizer_state_offload_batch_size: int = 1
     eager_decode: bool = False
+    rollout_routing_replay: bool = False
     decode_graph_buckets: list[int] = field(
         default_factory=lambda: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128, 192, 256]
     )
@@ -336,6 +337,10 @@ class EngineConfig:
             raise ValueError("runtime.kv_block_size must be >= 1")
         if self.runtime.kv_block_size % 256 != 0:
             raise ValueError("runtime.kv_block_size must be a multiple of 256 for FlashAttention paged KV")
+        # CUDA rollout trainers request R3 by default. Dense checkpoints do
+        # not have router decisions to capture and retain the original path.
+        if self.runtime.rollout_routing_replay and self.model.num_experts is None:
+            self.runtime.rollout_routing_replay = False
         self.runtime.resolve_attn_backend(model=self.model, devices=self.devices)
         self.runtime.resolve_compile_model(model=self.model, devices=self.devices)
         self.runtime.resolve_eager_decode(model=self.model, lora=self.lora)

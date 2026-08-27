@@ -315,6 +315,7 @@ class ArenoWorker:
             response_lens: torch.Tensor,
             finish_reason: str,
             truncate_stop_token_ids: tuple[int, ...],
+            routing_buffer: torch.Tensor | None = None,
         ) -> None:
             for row in rows.detach().cpu().tolist():
                 row_idx = int(row)
@@ -334,6 +335,7 @@ class ArenoWorker:
                         finish_reasons,
                         row_ids,
                         truncate_stop_token_ids,
+                        routing_buffer,
                     )
                     result_payload = self._stamp_adapter_version(result_payload)
                 request_id = request_ids[request_idx]
@@ -746,6 +748,7 @@ def _build_rollout_from_tensor_row_ids(
     finish_reasons: list[str],
     row_ids: list[int],
     truncate_stop_token_ids: tuple[int, ...],
+    routing_buffer: torch.Tensor | None = None,
 ) -> RolloutOutput:
     """Build a RolloutOutput for non-contiguous completed tensor rows."""
 
@@ -763,6 +766,7 @@ def _build_rollout_from_tensor_row_ids(
         torch.tensor(row[: len(response)], dtype=torch.float32)
         for row, response in zip(logprob_rows_cpu, response_ids, strict=True)
     ]
+    routed_experts = _completed_routing_rows(prompt_ids, response_ids, row_ids, routing_buffer)
     input_ids, attention_mask, response_mask, padded_logprobs = pad_rollout_rows(prompt_ids, response_ids, logprob_rows)
     return RolloutOutput(
         prompt_ids=prompt_ids,
@@ -773,7 +777,25 @@ def _build_rollout_from_tensor_row_ids(
         logprobs=padded_logprobs,
         finish_reason=finish_reason,
         metrics=None,
+        routed_experts=routed_experts,
     )
+
+
+def _completed_routing_rows(
+    prompt_ids: list[list[int]],
+    response_ids: list[list[int]],
+    row_ids: list[int],
+    routing_buffer: torch.Tensor | None,
+) -> list[torch.Tensor] | None:
+    """Materialize completed R3 rows without delaying continuous-batch replies."""
+
+    if routing_buffer is None:
+        return None
+    expected = [max(len(prompt) + len(response) - 1, 0) for prompt, response in zip(prompt_ids, response_ids)]
+    max_expected = max(expected, default=0)
+    row_index = torch.tensor(row_ids, device=routing_buffer.device, dtype=torch.long)
+    materialized = routing_buffer.index_select(0, row_index)[:, :max_expected].cpu()
+    return [materialized[row, :count].contiguous() for row, count in enumerate(expected)]
 
 
 def _build_rollout_from_tensor_rows(
@@ -835,6 +857,7 @@ def _slice_rollout_output(output: RolloutOutput, start: int, end: int) -> Rollou
         finish_reason=finish_reason,
         metrics=output.metrics,
         adapter_version=output.adapter_version,
+        routed_experts=output.routed_experts[start:end] if output.routed_experts is not None else None,
     )
 
 
@@ -858,4 +881,5 @@ def _slice_rollout_output_rows(output: RolloutOutput, rows: list[int]) -> Rollou
         finish_reason=finish_reason,
         metrics=output.metrics,
         adapter_version=output.adapter_version,
+        routed_experts=[output.routed_experts[row] for row in rows] if output.routed_experts is not None else None,
     )

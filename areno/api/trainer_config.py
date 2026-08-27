@@ -267,6 +267,9 @@ class RolloutTrainerConfig(TrainerConfig):
                 "optimizer_state_offload_batch_size": self.optimizer_state_offload_batch_size,
                 "eager_decode": self.eager_decode,
                 "attn_backend": self.attn_backend,
+                # R3 is the default CUDA path for rollout-based MoE training.
+                # EngineConfig disables it again when the checkpoint is dense.
+                "rollout_routing_replay": True,
             },
             lora=self.lora,
             reference_mode=self.reference_mode,
