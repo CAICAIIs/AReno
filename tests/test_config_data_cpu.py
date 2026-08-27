@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import types
@@ -12,6 +13,7 @@ import click
 import torch
 from click.testing import CliRunner
 
+from areno.adapters import LoraConfig
 from areno.api.data import PromptBatch, PromptItem
 from areno.api.trainer_config import RolloutTrainerConfig, TrainerConfig
 from areno.cli import train as train_cli
@@ -31,6 +33,7 @@ from areno.engine.layers.attention_backend.common import (
 )
 from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, _native_prefill
 from areno.engine.layers.attention_backend.train import _native_train, _native_train_areno
+from areno.engine.runtime import train_step as train_step_runtime
 from areno.engine.runtime.metadata import InferMeta, TrainMeta
 from areno.engine.training import _actor_train_model
 
@@ -198,6 +201,111 @@ class ConfigAndDataTest(unittest.TestCase):
 
         tp1 = EngineConfig(model=model, tp_size=1, devices=[0], sequence_parallel=True)
         self.assertFalse(tp1.effective_sequence_parallel)
+
+    def test_engine_config_allows_replicated_kv_lora_targets(self):
+        """Range-aware LoRA supports Qwen3 KV replication across wider TP."""
+        model = ModelConfig(
+            model_type="qwen3_moe",
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            intermediate_size=16,
+            vocab_size=32,
+        )
+
+        EngineConfig(
+            model=model,
+            tp_size=4,
+            devices=[0, 1, 2, 3],
+            lora=LoraConfig(),
+        )
+
+    def test_engine_config_rejects_router_bias_updates_only_for_lora(self):
+        """LoRA keeps router bias in the frozen base while fullweight may update it."""
+        model = ModelConfig(
+            model_type="bailing_moe_v3",
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=16,
+            vocab_size=32,
+            moe_router_bias_update_rate=1e-3,
+        )
+
+        with self.assertRaisesRegex(ValueError, "moe_router_bias_update_rate=0"):
+            EngineConfig(model=model, tp_size=1, devices=[0], lora=LoraConfig())
+
+        EngineConfig(model=model, tp_size=1, devices=[0])
+
+    def test_replicated_output_ranges_have_one_grad_norm_owner(self):
+        """Replicated B ranges contribute once while true TP shards contribute everywhere."""
+
+        def owners(output_range):
+            selected = []
+            for rank in range(4):
+                parameter = torch.nn.Parameter(torch.ones(2, 2))
+                parameter.grad = torch.ones_like(parameter)
+                parameter.tensor_model_parallel = True
+                if output_range is not None:
+                    parameter.tp_replicated_output_range = output_range
+                ctx = SimpleNamespace(rank=rank, world_size=4)
+                with patch.object(train_step_runtime, "get_tp_context", return_value=ctx):
+                    if list(train_step_runtime._grads_for_norm((parameter,))):
+                        selected.append(rank)
+            return selected
+
+        self.assertEqual(owners((0, 4, 4)), [0])
+        self.assertEqual(owners((0, 2, 4)), [0])
+        self.assertEqual(owners((2, 4, 4)), [2])
+        self.assertEqual(owners(None), [0, 1, 2, 3])
+
+    def test_reference_view_requires_lora_at_engine_boundary(self):
+        """The actor base can be reused only when the actor owns a native adapter."""
+        model = ModelConfig(num_attention_heads=4, num_key_value_heads=4, intermediate_size=16, vocab_size=32)
+
+        with self.assertRaisesRegex(ValueError, "requires native LoRA"):
+            EngineConfig(model=model, tp_size=1, devices=[0], reference_mode="reuse_actor_base")
+
+        config = EngineConfig(
+            model=model,
+            tp_size=1,
+            devices=[0],
+            lora=LoraConfig(),
+            reference_mode="reuse_actor_base",
+        )
+        self.assertEqual(config.reference_mode, "reuse_actor_base")
+
+    def test_trainer_config_propagates_lora_reference_view(self):
+        config = TrainerConfig(
+            algo="dpo",
+            ckpt="actor",
+            dataset_path="dataset",
+            lora=LoraConfig(),
+            reference_mode="reuse_actor_base",
+        )
+
+        self.assertEqual(config.cuda_config().reference_mode, "reuse_actor_base")
+
+    def test_adapter_path_uses_peft_metadata(self):
+        """A PEFT artifact should configure non-default native slots itself."""
+        with tempfile.TemporaryDirectory() as adapter_path:
+            Path(adapter_path, "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "peft_type": "LORA",
+                        "r": 4,
+                        "lora_alpha": 8,
+                        "lora_dropout": 0,
+                        "bias": "none",
+                        "target_modules": ["q_proj", "o_proj"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = LoraConfig(adapter_path=adapter_path)
+
+        self.assertEqual(config.rank, 4)
+        self.assertEqual(config.alpha, 8)
+        self.assertEqual(config.target_modules, ("q_proj", "o_proj"))
 
     def test_runtime_config_attn_backend_propagates_to_model_config(self):
         """The runtime attention backend should reach model layer construction."""
@@ -447,6 +555,31 @@ class ConfigAndDataTest(unittest.TestCase):
         self.assertTrue(torch.equal(captured["value_tail"], torch.zeros(2, 2, 2)))
         self.assertIs(captured["meta"], meta)
         self.assertEqual(tuple(out.shape), (1, 2, 2, 4))
+
+    def test_native_decode_pads_value_dim_and_trims_output(self):
+        """Native decode should return the original V dim after using a QK-sized cache."""
+        backend = FlashAttnInferBackend("native")
+        q = torch.zeros(1, 1, 2, 6)
+        k = torch.zeros(1, 1, 2, 6)
+        v = torch.zeros(1, 1, 2, 4)
+        k_cache = torch.zeros(1, 2, 2, 6)
+        v_cache = torch.zeros(1, 2, 2, 6)
+        meta = InferMeta(
+            mode="decode",
+            cache_seqlens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+        )
+        captured = {}
+
+        def fake_native_decode(**kwargs):
+            captured["v_update_shape"] = tuple(kwargs["v_update"].shape)
+            return torch.ones_like(kwargs["q"])
+
+        with patch("areno.engine.layers.attention_backend.infer._native_decode", fake_native_decode):
+            out = backend(q, k, v, k_cache, v_cache, meta)
+
+        self.assertEqual(captured["v_update_shape"], (1, 2, 6))
+        self.assertEqual(tuple(out.shape), (1, 1, 2, 4))
 
     def test_native_attention_backend_does_not_require_flash_attn_import(self):
         """Native train/infer backends should construct without flash-attn installed."""
@@ -809,6 +942,17 @@ class ConfigAndDataTest(unittest.TestCase):
 
         self.assertEqual(sft_cfg.algo, "sft")
         self.assertEqual(dpo_cfg.algo, "dpo")
+
+    def test_train_cli_accepts_stable_base_reference_for_adapter_metadata(self):
+        config = train_cli._trainer_config_from_options(
+            **_train_options(
+                ckpt="/pcache/local/base",
+                base_model_name_or_path="aistudio://project/base",
+            )
+        )
+
+        self.assertEqual(config.base_model_name_or_path, "aistudio://project/base")
+        self.assertEqual(config.cuda_config().base_model_name_or_path, "aistudio://project/base")
 
     def test_train_cli_preflight_rejects_agent_file_without_callable_run_agent(self):
         """Agent hooks should fail before rollout/backend-heavy work."""

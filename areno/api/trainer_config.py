@@ -11,8 +11,10 @@ critic warmup window.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
+from areno.adapters.config import LoraConfig
 from areno.api.defaults import DEFAULT_METRICS_LOG_DIR
 
 
@@ -28,6 +30,7 @@ class TrainerConfig:
     ckpt: str
     dataset_path: str
     backend: str | None = None
+    base_model_name_or_path: str | None = field(default=None, kw_only=True)
     model_hub: str = "modelscope"
     dataset_loader_fn: str | None = None
     save_path: str | None = None
@@ -76,6 +79,8 @@ class TrainerConfig:
     agent_timeout_s: float = 300.0
     train_tool_results: bool = False
     chat_template_enable_thinking: bool | None = None
+    lora: LoraConfig | None = None
+    reference_mode: Literal["independent", "reuse_actor_base"] = "independent"
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -116,6 +121,8 @@ class TrainerConfig:
             self.multimodal_projector_lr_decay_steps,
             self.multimodal_projector_lr_decay_style,
         )
+        if self.lora is not None and self.backend != "cuda":
+            raise ValueError("native LoRA is only supported by the CUDA backend")
 
     @staticmethod
     def _validate_multimodal_optimizer_group(
@@ -197,6 +204,7 @@ class TrainerConfig:
         from areno.api.config import CudaConfig
 
         return CudaConfig(
+            base_model_name_or_path=self.base_model_name_or_path,
             tp_size=self.tp_size,
             sequence_parallel=self.sequence_parallel,
             devices=self.train_devices,
@@ -210,6 +218,8 @@ class TrainerConfig:
                 "eager_decode": self.eager_decode,
                 "attn_backend": self.attn_backend,
             },
+            lora=self.lora,
+            reference_mode=self.reference_mode,
         )
 
 
@@ -240,6 +250,7 @@ class RolloutTrainerConfig(TrainerConfig):
         from areno.api.config import CudaConfig
 
         return CudaConfig(
+            base_model_name_or_path=self.base_model_name_or_path,
             tp_size=self.tp_size,
             sequence_parallel=self.sequence_parallel,
             devices=self.train_devices,
@@ -257,6 +268,8 @@ class RolloutTrainerConfig(TrainerConfig):
                 "eager_decode": self.eager_decode,
                 "attn_backend": self.attn_backend,
             },
+            lora=self.lora,
+            reference_mode=self.reference_mode,
         )
 
     def mlx_config(self):

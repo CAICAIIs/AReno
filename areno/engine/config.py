@@ -16,6 +16,8 @@ from typing import Any, Literal
 
 import torch
 
+from areno.adapters.config import LoraConfig
+
 # AReno's flash path uses flash-attn features beyond the Turing-compatible
 # forward kernels, including paged KV/cache and training paths, so require
 # Ampere+ even though flash-attn 2.x has partial sm75 forward support.
@@ -118,6 +120,23 @@ class RuntimeConfig:
             stacklevel=2,
         )
         self.compile_model = False
+
+    def resolve_eager_decode(self, *, model: ModelConfig, lora: LoraConfig | None) -> None:
+        """Use eager decode when routed-expert adapters lack a fused rollout path."""
+
+        if self.eager_decode or lora is None:
+            return
+        if model.model_type == "qwen3_moe" and {
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        } & set(lora.target_modules):
+            warnings.warn(
+                "routed-expert LoRA uses grouped execution during rollout; falling back to eager decode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.eager_decode = True
 
 
 @dataclass(slots=True)
@@ -263,6 +282,10 @@ class EngineConfig:
     dummy_load: bool = False
     role: Literal["train", "rollout"] = "train"
     policy_sync_bucket_mb: int = 64
+    lora: LoraConfig | None = None
+    lora_seed: int = 0
+    reference_mode: Literal["independent", "reuse_actor_base"] = "independent"
+    base_model_name_or_path: str | None = None
 
     def __post_init__(self) -> None:
         """Infer DP/devices and validate the distributed layout."""
@@ -270,6 +293,16 @@ class EngineConfig:
         if self.sequence_parallel is not None:
             self.model.sequence_parallel = bool(self.sequence_parallel)
         self.model.validate_tp(self.tp_size)
+        if self.reference_mode not in {"independent", "reuse_actor_base"}:
+            raise ValueError("reference_mode must be one of: independent, reuse_actor_base")
+        if self.reference_mode == "reuse_actor_base" and self.lora is None:
+            raise ValueError("reference_mode='reuse_actor_base' requires native LoRA")
+        if (
+            self.lora is not None
+            and self.model.model_type == "bailing_moe_v3"
+            and self.model.moe_router_bias_update_rate != 0.0
+        ):
+            raise ValueError("native LoRA requires moe_router_bias_update_rate=0 to keep the base policy frozen")
         if self.devices is None:
             if torch.cuda.is_available():
                 device_count = torch.cuda.device_count()
@@ -305,6 +338,7 @@ class EngineConfig:
             raise ValueError("runtime.kv_block_size must be a multiple of 256 for FlashAttention paged KV")
         self.runtime.resolve_attn_backend(model=self.model, devices=self.devices)
         self.runtime.resolve_compile_model(model=self.model, devices=self.devices)
+        self.runtime.resolve_eager_decode(model=self.model, lora=self.lora)
         self.model.attn_backend = self.runtime.attn_backend
 
     @property

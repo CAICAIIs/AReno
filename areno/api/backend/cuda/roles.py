@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from areno.engine.checkpoints.io import SafetensorsIndex
@@ -272,30 +274,32 @@ class WorkerRole:
     def onload(self, device: torch.device) -> None:
         """Move this role's model, value head, and optimizer state to `device`."""
 
-        self.model.to(device)
-        self.model.onload_train_weights(device)
-        if self.value_head is not None:
-            self.value_head.to(device)
-        if self.optimizer is not None:
-            if self.optimizer_offload_mode == "disk":
-                self.optimizer.configure_state_offload(
-                    mode="disk",
-                    directory=self.optimizer_offload_dir,
-                    batch_size=self.optimizer_offload_batch_size,
-                )
-                self.optimizer.prefetch_state()
-            else:
-                self.optimizer.onload_state(device)
+        with torch.inference_mode(False), torch.no_grad():
+            self.model.to(device)
+            self.model.onload_train_weights(device)
+            if self.value_head is not None:
+                self.value_head.to(device)
+            if self.optimizer is not None:
+                if self.optimizer_offload_mode == "disk":
+                    self.optimizer.configure_state_offload(
+                        mode="disk",
+                        directory=self.optimizer_offload_dir,
+                        batch_size=self.optimizer_offload_batch_size,
+                    )
+                    self.optimizer.prefetch_state()
+                else:
+                    self.optimizer.onload_state(device)
 
     def onload_for_inference(self, device: torch.device) -> None:
         """Move this role to `device` and materialize derived inference weights."""
 
-        self.model.to(device)
-        self.model.onload_train_weights(device)
+        with torch.inference_mode(False), torch.no_grad():
+            self.model.to(device)
+            self.model.onload_train_weights(device)
+            if self.value_head is not None:
+                self.value_head.to(device)
         self.model.prepare_infer_weights()
         self.model.offload_train_weights()
-        if self.value_head is not None:
-            self.value_head.to(device)
 
     def offload(self) -> None:
         """Free all HBM held by this role."""
@@ -322,6 +326,7 @@ class RoleManager:
     def __init__(self, worker):
         self.worker = worker
         self.roles: dict[str, WorkerRole] = {}
+        self.actor_base_roles: set[str] = set()
 
     def ensure_roles(self, payload: EnsureRolesPayload) -> None:
         """Lazily instantiate non-actor roles."""
@@ -330,14 +335,17 @@ class RoleManager:
         worker._prepare_actor_offloaded()
         model_sources: dict[str, torch.nn.Module] = {}
         actor_path = canonical_model_path(worker.config.model_path)
-        if actor_path is not None:
+        if actor_path is not None and worker.adapter_registry is None:
             model_sources[actor_path] = unwrap_model(worker.model)
         for role in self.roles.values():
             role_path = canonical_model_path(role.path)
             if role_path is not None:
                 model_sources.setdefault(role_path, role.model)
         for name, spec in payload.roles.items():
-            if name == "actor" or name in self.roles:
+            if name == "actor" or name in self.roles or name in self.actor_base_roles:
+                continue
+            if spec.reference_mode == "reuse_actor_base":
+                self.actor_base_roles.add(name)
                 continue
             path = spec.path
             cache_key = canonical_model_path(path)
@@ -369,36 +377,40 @@ class RoleManager:
         worker = self.worker
         ctx = get_tp_context()
         role_name = payload.role
-        if role_name == "actor":
-            worker._prepare_actor_for_inference()
-            model = worker.model
-            offload_role = None
-            sequence_parallel = worker.config.effective_sequence_parallel
-        else:
-            offload_role = self.roles[role_name]
-            worker._prepare_actor_offloaded()
-            offload_role.onload_for_inference(worker.device)
-            model = offload_role.model
-            sequence_parallel = offload_role.sequence_parallel
-        model.eval()
-        try:
-            token_rows = payload.token_rows_by_dp[ctx.dp_rank]
-            features = payload.features_by_dp[ctx.dp_rank] if payload.features_by_dp is not None else None
-            local = (
-                []
-                if not token_rows
-                else self._score_logprob_rows(
-                    model,
-                    token_rows,
-                    payload,
-                    features=features,
-                    sequence_parallel=sequence_parallel,
+        actor_view = role_name == "actor" or role_name in self.actor_base_roles
+        base_only = role_name in self.actor_base_roles
+        view = worker.adapter_registry.base_only() if base_only else nullcontext()
+        with view:
+            if actor_view:
+                worker._prepare_actor_for_inference()
+                model = worker.model
+                offload_role = None
+                sequence_parallel = worker.config.effective_sequence_parallel
+            else:
+                offload_role = self.roles[role_name]
+                worker._prepare_actor_offloaded()
+                offload_role.onload_for_inference(worker.device)
+                model = offload_role.model
+                sequence_parallel = offload_role.sequence_parallel
+            model.eval()
+            try:
+                token_rows = payload.token_rows_by_dp[ctx.dp_rank]
+                features = payload.features_by_dp[ctx.dp_rank] if payload.features_by_dp is not None else None
+                local = (
+                    []
+                    if not token_rows
+                    else self._score_logprob_rows(
+                        model,
+                        token_rows,
+                        payload,
+                        features=features,
+                        sequence_parallel=sequence_parallel,
+                    )
                 )
-            )
-            return local if ctx.rank == 0 else None
-        finally:
-            if offload_role is not None:
-                offload_role.offload()
+                return local if ctx.rank == 0 else None
+            finally:
+                if offload_role is not None:
+                    offload_role.offload()
 
     def _score_logprob_rows(
         self,

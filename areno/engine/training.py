@@ -184,6 +184,8 @@ class TrainingManager:
             worker.optimizer.step()
             worker.optimizer.zero_grad(set_to_none=True)
             worker._global_step += 1
+            if worker.adapter_registry is not None:
+                worker.adapter_registry.increment_version()
             if worker.device.type == "cuda":
                 torch.cuda.empty_cache()
         else:
@@ -201,11 +203,13 @@ class TrainingManager:
                 "loss": float(loss.detach().cpu()),
                 "stepped": stepped,
                 "global_step": worker._global_step,
+                "adapter_version": (worker.adapter_registry.version if worker.adapter_registry is not None else None),
                 "metrics": _merge_metrics(
                     metrics,
                     None,
                     {"lr": current_lr},
                     multimodal_lrs,
+                    {"sequence_parallel": float(model_kwargs["train_meta"].sequence_parallel)},
                     {"grad_norm": grad_norm} if grad_norm is not None else None,
                     multimodal_grad_metrics,
                     {"clipped_grad_norm": clipped_grad_norm} if clipped_grad_norm is not None else None,
@@ -279,11 +283,32 @@ class TrainingManager:
         ctx = get_tp_context()
         if ctx.world_size == 1:
             return
+        ranged = []
         for param in worker.model.parameters():
             grad = param_grad(param)
-            if grad is None or not bool(getattr(param, "tp_grad_allreduce", False)):
+            if grad is None:
                 continue
-            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
+            output_range = getattr(param, "tp_replicated_output_range", None)
+            if output_range is not None:
+                start, end, global_size = output_range
+                canonical_numel = global_size * grad[0].numel()
+                ranged.append((grad, start, end, global_size, canonical_numel))
+            elif bool(getattr(param, "tp_grad_allreduce", False)):
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
+        if not ranged:
+            return
+        packed = ranged[0][0].new_zeros(sum(item[-1] for item in ranged))
+        offset = 0
+        for grad, start, end, global_size, canonical_numel in ranged:
+            canonical = packed.narrow(0, offset, canonical_numel).view(global_size, *grad.shape[1:])
+            canonical[start:end].copy_(grad)
+            offset += canonical_numel
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=ctx.group)
+        offset = 0
+        for grad, start, end, global_size, canonical_numel in ranged:
+            canonical = packed.narrow(0, offset, canonical_numel).view(global_size, *grad.shape[1:])
+            grad.copy_(canonical[start:end])
+            offset += canonical_numel
 
     def _sync_data_parallel_gradients(self) -> None:
         """Average resident full gradients across data-parallel replicas."""

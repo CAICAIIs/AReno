@@ -1,7 +1,7 @@
 """CUDA adapter from the public `Trainer` API onto `ArenoEngine`.
 
-areno runs a co-located train + rollout engine in the same process group.
-This file is the thin glue that:
+areno can run colocated or independent train and rollout engines. This file is
+the thin glue that:
 
 - starts the engine with the dataclass-validated `CudaConfig`,
 - forwards rollout requests through `generate_rollout` while translating
@@ -156,7 +156,6 @@ class CudaBackend(Backend):
             raise ValueError(f"training device count must equal world_size={world_size}")
         if cfg.rollout_tp_size is not None and cfg.rollout_devices is None:
             raise ValueError("rollout_tp_size requires rollout_devices")
-
         if not cfg.uses_separate_rollout_engine():
             self._train_engine = ArenoEngine.from_pretrained(
                 cfg.model_path or ctx.model_path,
@@ -169,6 +168,9 @@ class CudaBackend(Backend):
                 runtime_config=RuntimeConfig(**cfg.runtime),
                 loss_fn=dispatch_loss,
                 policy_sync_bucket_mb=cfg.policy_sync_bucket_mb,
+                lora_config=cfg.lora,
+                reference_mode=cfg.reference_mode,
+                base_model_name_or_path=cfg.base_model_name_or_path,
             )
             return
         self._policy_sync_bucket_bytes = cfg.policy_sync_bucket_mb * 1024 * 1024
@@ -222,6 +224,9 @@ class CudaBackend(Backend):
             optimizer_config=OptimizerConfig(**cfg.optimizer),
             loss_fn=dispatch_loss,
             role="train",
+            lora_config=cfg.lora,
+            reference_mode=cfg.reference_mode,
+            base_model_name_or_path=cfg.base_model_name_or_path,
             cluster_kwargs={"world_spec": world_spec, "partition": train_partition},
             **common,
         )
@@ -235,6 +240,8 @@ class CudaBackend(Backend):
             runtime_config=rollout_runtime,
             loss_fn=None,
             role="rollout",
+            lora_config=cfg.lora,
+            base_model_name_or_path=cfg.base_model_name_or_path,
             policy_sync_bucket_mb=cfg.policy_sync_bucket_mb,
             start=False,
             cluster_kwargs={"world_spec": world_spec, "partition": rollout_partition},
@@ -355,7 +362,12 @@ class CudaBackend(Backend):
             RolloutSequence(resp_tokens=tokens, resp_logprobs=rollout.logprobs[index, : len(tokens)].tolist())
             for index, tokens in enumerate(rollout.response_ids)
         ]
-        return group_rollout_sequences(sequences, len(prompt_tokens), n_samples)
+        return group_rollout_sequences(
+            sequences,
+            len(prompt_tokens),
+            n_samples,
+            adapter_version=rollout.adapter_version,
+        )
 
     def begin_rollout_session(self, ctx: Context) -> None:
         """Prepare colocated actor state before rollout requests are issued."""
@@ -459,7 +471,12 @@ class CudaBackend(Backend):
             RolloutSequence(resp_tokens=tokens, resp_logprobs=rollout.logprobs[index, : len(tokens)].tolist())
             for index, tokens in enumerate(rollout.response_ids)
         ]
-        return group_rollout_sequences(sequences, len(prompt_tokens), n_samples)
+        return group_rollout_sequences(
+            sequences,
+            len(prompt_tokens),
+            n_samples,
+            adapter_version=rollout.adapter_version,
+        )
 
     def train(
         self,
@@ -501,7 +518,10 @@ class CudaBackend(Backend):
             )
         stats_list = engine.step(packs, gradient_accumulation_steps=gradient_accumulation_steps)
         if self._separate_rollout and any(bool(stats.stepped) for stats in stats_list):
-            self._train_policy_version += 1
+            adapter_versions = [stats.adapter_version for stats in stats_list if stats.adapter_version is not None]
+            self._train_policy_version = (
+                int(adapter_versions[-1]) if adapter_versions else self._train_policy_version + 1
+            )
         train_time_s = time.perf_counter() - train_start
         metric_rows: list[dict[str, float]] = []
         for stats in stats_list:
@@ -510,6 +530,8 @@ class CudaBackend(Backend):
                 metric_rows.append({str(key): float(value) for key, value in stats.metrics.items()})
         metrics = reduce_microbatch_metrics(metric_rows)
         result = {"loss": sum(losses) / max(len(losses), 1)}
+        if stats_list and stats_list[-1].adapter_version is not None:
+            result["adapter_version"] = stats_list[-1].adapter_version
         result.update(metrics)
         result.update(self._pending_policy_sync_metrics)
         self._pending_policy_sync_metrics = {}
@@ -530,6 +552,10 @@ class CudaBackend(Backend):
     def save_checkpoint(self, ctx: Context, path: str) -> str:
         engine = self._require_train_engine()
         return save_checkpoint(engine, path)
+
+    def export_adapter(self, ctx: Context, path: str) -> str:
+        del ctx
+        return self._require_train_engine().export_adapter(path)
 
     def ensure_roles(self, ctx: Context, roles: dict[str, ModelRole]) -> None:
         engine = self._require_train_engine()

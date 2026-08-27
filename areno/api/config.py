@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import platform
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
+from areno.adapters.config import LoraConfig
 from areno.api.models import BackendType
 
 
@@ -20,9 +21,14 @@ class CudaConfig:
     The `optimizer` and `runtime` dicts are passed verbatim to the engine's
     `OptimizerConfig`/`RuntimeConfig` so any new tuning knob can be added
     without changing this file.
+
+    `base_model_name_or_path` keeps the caller-facing model reference for
+    portable PEFT metadata when `model_path` has already resolved to a local
+    cache path.
     """
 
     model_path: str | None = None
+    base_model_name_or_path: str | None = field(default=None, kw_only=True)
     tp_size: int = 1
     sequence_parallel: bool | None = None
     dp_size: int | None = None
@@ -35,6 +41,8 @@ class CudaConfig:
     runtime: dict[str, Any] = field(default_factory=dict)
     max_running_prompts: int = 64
     decode_progress_interval_s: float = 10.0
+    lora: LoraConfig | None = None
+    reference_mode: Literal["independent", "reuse_actor_base"] = "independent"
 
     def uses_separate_rollout_engine(self) -> bool:
         """Return whether rollout runs on its own CUDA device partition."""
