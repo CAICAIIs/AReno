@@ -38,6 +38,9 @@ def _run_offset_tp_broadcast(global_rank: int, port: int, output_queue) -> None:
 def _mock_distributed(monkeypatch):
     calls = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # These tests exercise group construction only, not the rendezvous, so
+    # the client TCPStore and the process-group init are both faked.
+    monkeypatch.setattr(context.dist, "TCPStore", lambda *args, **kwargs: object())
     monkeypatch.setattr(context.dist, "init_process_group", lambda **kwargs: calls.append(("init", kwargs)))
 
     def new_group(*, ranks):
