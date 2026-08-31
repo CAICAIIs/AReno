@@ -1,17 +1,19 @@
-"""FP8 (W8A16) decode-linear for the areno.accel surface.
+"""FP8 (W8A16) decode-linear for the areno.accel surface (target: H20 / Hopper).
 
 Two backends implement the dequant-linear ``y = x @ (e4m3(w) * scale)``:
 
-* ``quantized_fp8_scaled_mm`` — Hopper (cc >= 8.9) via ``torch._scaled_mm``. This
-  is the decode fast path: cuBLASLt reads the 1-byte FP8 weight directly (~2x,
-  and more accurate, than the Triton path). ``_scaled_mm`` is A8W8 (it rejects a
-  bf16 activation), so the activation is also quantized to E4M3 — a W8A8 decode,
-  not weight-only.
-* ``quantized_fp8_linear`` — Triton matmul, the non-Hopper fallback (Ampere). It
-  is weight-only (bf16 activation); on this stack it measures *slower* than bf16,
-  so it is a correctness path rather than a speedup. ``num_stages`` pipelining,
-  large ``BLOCK_K`` and the ``.cg`` cache modifier tune the memory-bound shape;
-  the per-tensor scale is applied after the dot.
+* ``quantized_fp8_scaled_mm`` — Hopper (cc >= 8.9, e.g. H20) via ``torch._scaled_mm``.
+  This is the decode fast path: cuBLASLt reads the 1-byte FP8 weight directly
+  (~2x, and more accurate, than the Triton path). ``_scaled_mm`` is A8W8 (it
+  rejects a bf16 activation), so the activation is also quantized to E4M3 — a
+  W8A8 decode, not weight-only.
+* ``quantized_fp8_linear`` — Triton matmul, kept as a non-Hopper fallback. It is
+  weight-only (bf16 activation); on this stack it measures *slower* than bf16, so
+  it is a correctness path rather than a speedup.
+
+The target host for the decode speedup is H20 (Hopper, cc 9.0): on Qwen3-8B MLP
+shapes the A8W8 ``_scaled_mm`` path is ~1.6x end-to-end per MLP block (2x per
+linear), compared to a bf16 baseline, under CUDA graphs.
 
 Decode-only: FP8 has no backward, so this must not enter a training graph.
 """
