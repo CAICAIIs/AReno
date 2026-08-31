@@ -8,12 +8,11 @@ memory-bandwidth speedup comes from a fused FP8-dequant matmul that reads the
 correctness and the exact scale semantics before that kernel lands.
 
 Note on FP8 grids: this module (and ``QuantizedLinear``) uses **E4M3** as the
-reference grid — the same grid the wired W8A16 decode path stores
-(``mark_fp8_weight`` in ``fp8_linear.py``). Triton accepts E5M2 on Ampere but
-rejects E4M3 (``fp8e4nv``), so the Triton kernel converts the E4M3 payload to
-E5M2 there. ``torch._scaled_mm`` (Hopper, A8W8) is a separate fast path measured
-in ``scripts/bench/h20_fp8_scaled_mm.py``. ``compute_fp8_scale``/
-``quantize_to_fp8`` are dtype-agnostic apart from the constant ``_FP8_E4M3_MAX``.
+reference grid — the same grid the decode path stores (``mark_fp8_weight`` in
+``fp8_linear.py``). On Hopper the decode runs ``torch._scaled_mm`` (A8W8) which
+takes E4M3 on both sides; on Ampere the Triton kernel converts the E4M3 payload
+to E5M2 (Triton rejects ``fp8e4nv``). ``compute_fp8_scale``/``quantize_to_fp8``
+are dtype-agnostic apart from the constant ``_FP8_E4M3_MAX``=448.
 
 This is deliberately small and dependency-free (only torch).
 """
