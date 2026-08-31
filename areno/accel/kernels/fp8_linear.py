@@ -1,15 +1,17 @@
 """FP8 (W8A16) decode-linear for the areno.accel surface.
 
-Runs ``y = x @ (w_fp8 * scale)`` reading the 1-byte FP8 weight directly — the
-memory-bound decode benefit. Two backends share the same W8A16 semantics:
+Runs ``y = x @ (e4m3(w) * scale)`` reading the 1-byte FP8 weight directly — the
+memory-bound decode benefit. The wired decode path is a Triton matmul that works
+on every device; Ampere Triton only accepts the E5M2 grid, so the E4M3 payload is
+converted to E5M2 in-kernel. ``num_stages`` pipelining, a large ``BLOCK_K`` and
+the ``.cg`` cache modifier tune for the memory-bound decode shape, and the
+per-tensor scale is applied to the accumulator **after** the dot
+(``(x @ w_fp8) * scale == x @ (w_fp8 * scale)``), avoiding a per-element dequant
+in the inner loop.
 
-* ``quantized_fp8_scaled_mm`` — Hopper (cc >= 8.9) via ``torch._scaled_mm``, the
-  primary path (E4M3 grid, weight read once at 1 byte/elem).
-* ``quantized_fp8_linear`` — Triton matmul (A100 fallback). Ampere Triton only
-  accepts the E5M2 grid, so the E4M3 payload is converted to E5M2 in-kernel.
-  ``num_stages`` pipelining, large ``BLOCK_K`` and the ``.cg`` cache modifier
-  tune for the memory-bound decode shape, and the per-tensor scale is applied to
-  the accumulator **after** the dot (``(x @ w_fp8) * scale == x @ (w_fp8 * scale)``).
+``torch._scaled_mm`` (Hopper, A8W8) is the alternative fast path — examined by
+``scripts/bench/h20_fp8_scaled_mm.py`` — but it is not wired in because it also
+quantizes the activation (W8A8); this module is weight-only (W8A16).
 
 Decode-only: the FP8 grid has no backward, so this must not enter a training graph.
 """
@@ -118,36 +120,14 @@ def dequantize_fp8_weight(w_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Ten
     return (w_fp8.float() * scale.to(torch.float32)).to(torch.bfloat16)
 
 
-def scaled_mm_available() -> bool:
-    """``torch._scaled_mm`` (FP8 E4M3) needs Hopper/Ada (compute capability >= 8.9)."""
-    if not hasattr(torch, "_scaled_mm") or not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability(0) >= (8, 9)
-
-
-def quantized_fp8_scaled_mm(x: torch.Tensor, w_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Hopper FP8 linear via ``torch._scaled_mm``: ``y = x @ (e4m3(w) * scale)^T``.
-
-    ``x`` is bf16 (M, K); ``w_fp8`` is E4M3 (N, K) with a per-tensor scalar
-    ``scale``. ``torch._scaled_mm`` takes mat1 (M, K) and mat2 (K, N), so the
-    weight is transposed to (K, N); ``scale_b`` scales the FP8 operand (the bf16
-    activation scale is identity). Dequantizing the weights first would defeat the
-    memory-bound win, so this reads the bytes directly.
-    """
-    if not (x.is_cuda and w_fp8.is_cuda and scale.is_cuda):
-        raise RuntimeError("quantized_fp8_scaled_mm requires CUDA inputs")
-    w_t = w_fp8.t().contiguous()
-    return torch._scaled_mm(x, w_t, out_dtype=torch.bfloat16, scale_b=scale)
-
-
 def mark_fp8_weight(weight: torch.Tensor, *, fp8_dtype=torch.float8_e4m3fn) -> torch.Tensor:
     """Quantize a bf16 weight in place and stash the FP8 payload for the linear hook.
 
     Sets ``weight._areno_fp8`` (FP8 grid tensor) and ``weight._areno_fp8_scale``
-    (per-tensor scale) so ``_areno_linear_forward`` dispatches to the FP8 decode
-    path. Returns ``weight``. Default grid is E4M3 (the finer grid used by
-    ``torch._scaled_mm`` on Hopper); the A100 Triton fallback converts to E5M2 at
-    kernel time. Per-tensor scale only (both kernels read a single scalar).
+    (per-tensor scale) so ``_areno_linear_forward`` dispatches to the W8A16
+    decode path. Returns ``weight``. The default grid is E4M3 (finer); the Triton
+    kernel converts to E5M2 where Triton rejects E4M3 (Ampere). Per-tensor scale
+    only.
     """
     from areno.engine.quantization import compute_fp8_scale
 

@@ -61,8 +61,10 @@ def main() -> None:
         # --- FP8 W8A8 via _scaled_mm (reads 1 byte/weight) ---
         xq, xs = quant_fp8(x)
         wq, ws = quant_fp8(w)
-        # _scaled_mm(a,b): a (M,K) fp8, b (K,N) fp8 -> (M,N). w is (N,K), need w^T (K,N).
-        wq_t = wq.to(torch.float8_e4m3fn).t().contiguous()
+        # _scaled_mm(a,b): a (M,K) fp8, b (K,N) fp8 -> (M,N). w is (N,K), need w^T
+        # (K,N). mat2 must stay a column-major view (w.t(), NOT .contiguous()) or
+        # cuBLASLt rejects it.
+        wq_t = wq.t()
         sm = torch._scaled_mm if hasattr(torch, "_scaled_mm") else None
         if sm is None:
             print(f"M={M} N={N}: torch._scaled_mm NOT available")
