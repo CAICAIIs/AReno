@@ -45,7 +45,7 @@ def mark_tensor_parallel_parameter(
 
 
 class QuantizedLinear(nn.Module):
-    """W8A16 FP8 dequant-forward reference module (RFC 0001, M1).
+    """W8A16 FP8 dequant-forward reference module.
 
     Quantizes its bf16 weight to FP8 on demand and runs a dequant-forward matmul
     (``x @ dequant(w_q)^T``), so the exact FP8 scale semantics are testable on CPU.
@@ -332,19 +332,26 @@ class RowParallelLinear(nn.Module):
 def _areno_linear_forward(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """Single entry point so all parallel linears share the areno.accel matmul."""
 
-    # FP8 path (RFC 0001): a weight carrying an FP8 payload (weight._areno_fp8 +
-    # weight._areno_fp8_scale) routes through the Triton W8A16 dequant-linear.
+    # FP8 path: a weight carrying an FP8 payload (weight._areno_fp8 +
+    # weight._areno_fp8_scale) routes through the W8A16 dequant-linear. Prefer
+    # torch._scaled_mm on Hopper (E4M3, reads the weight bytes directly); fall
+    # back to the Triton kernel elsewhere (A100 converts the payload to E5M2).
     # Opt-in and backward-compatible: unmarked weights take the existing path.
     fp8 = getattr(weight, "_areno_fp8", None)
     if fp8 is not None:
         scale = weight._areno_fp8_scale
-        from areno.accel.kernels.fp8_linear import quantized_fp8_linear
+        from areno.accel.kernels.fp8_linear import quantized_fp8_linear, scaled_mm_available
 
         # Decode/prefill may hand a 3-D (1, seq, hidden) activation; flatten to 2-D
         # for the kernel then restore the leading dims.
         out_ndim = x.ndim
         xx = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-        out = quantized_fp8_linear(xx, fp8, scale)
+        if scaled_mm_available():
+            from areno.accel.kernels.fp8_linear import quantized_fp8_scaled_mm
+
+            out = quantized_fp8_scaled_mm(xx, fp8, scale)
+        else:
+            out = quantized_fp8_linear(xx, fp8, scale)
         if bias is not None:
             out = out + bias
         if out_ndim > 2:

@@ -2,17 +2,18 @@
 
 These helpers implement the FP8 (E4M3) quantize/dequant math in a dtype-agnostic
 way so they run on CPU (for unit tests) as well as on GPU. They are the
-correctness reference for the FP8 vertical slice (RFC 0001, M1): the intended
+correctness reference for the FP8 W8A16 slot: the intended
 memory-bandwidth speedup comes from a fused FP8-dequant matmul that reads the
 1-byte weights directly; the dequant-forward path here establishes numerical
 correctness and the exact scale semantics before that kernel lands.
 
 Note on FP8 grids: this module (and ``QuantizedLinear``) uses **E4M3** as the
-reference grid. The model's runtime FP8 path in ``fp8_linear.py`` uses **E5M2**,
-because on Ampere (A100) Triton only accepts the E5M2 grid and rejects E4M3
-(``fp8e4nv``); see RFC 0001 §4.6. The fused E4M3 dequant kernels live in
-``areno/accel/csrc/e4m3_linear.cu``. ``compute_fp8_scale``/``quantize_to_fp8``
-are dtype-agnostic apart from the constant ``_FP8_E4M3_MAX``=448.
+reference grid — the same grid the runtime decode path stores (``mark_fp8_weight``
+in ``fp8_linear.py``). On Hopper the decode runs ``torch._scaled_mm`` with E4M3
+directly; on Ampere (A100) the Triton kernel converts the E4M3 payload to E5M2
+(Triton rejects ``fp8e4nv`` there), so A100 is a coarser fallback.
+``compute_fp8_scale``/``quantize_to_fp8`` are dtype-agnostic apart from the
+constant ``_FP8_E4M3_MAX``=448.
 
 This is deliberately small and dependency-free (only torch).
 """

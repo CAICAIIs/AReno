@@ -1,4 +1,4 @@
-"""CPU tests for FP8 weight quantization (RFC 0001, M1).
+"""CPU tests for FP8 weight quantization (W8A16).
 
 These run without a GPU: the quantize/dequant math is implemented on float
 tensors and the `QuantizedLinear` module is a reference W8A16 dequant-forward

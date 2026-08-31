@@ -73,7 +73,7 @@ class ArenoWorker:
         if config.model_path is not None and not config.dummy_load:
             load_model_weights(self.model, config.model, config.model_path)
         if config.model.quant_method == "fp8" or os.getenv("ARENO_QUANT_FP8", "0") in {"1", "true", "True", "yes"}:
-            # Decode-only FP8 (RFC 0001): the W8A16 kernel has no backward, so a train
+            # Decode-only FP8: the W8A16 kernel has no backward, so a train
             # worker would silently accumulate zero gradient. Guard against that.
             if config.role == "train":
                 raise RuntimeError(

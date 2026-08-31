@@ -25,8 +25,8 @@ def quantize_model_weights_fp8(model: torch.nn.Module) -> int:
 
     Calls ``mark_fp8_weight`` on the weight of each column/merged/row-parallel
     linear so ``_areno_linear_forward`` routes those through the FP8 W8A16
-    kernel (RFC 0001). Decode/inference-only — the Triton FP8 kernel has no
-    backward, so this must not be used in a training step. Returns the count.
+    decode path. Decode-only — the FP8 kernels have no backward, so this must not
+    be used in a training step. Returns the count.
     """
     from areno.accel.kernels.fp8_linear import mark_fp8_weight
     from areno.engine.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear

@@ -11,7 +11,6 @@ torch::Tensor areno_d_silu_cuda(torch::Tensor grad_output, torch::Tensor input);
 torch::Tensor areno_d_sigmoid_cuda(torch::Tensor grad_output, torch::Tensor output);
 torch::Tensor areno_d_softplus_cuda(torch::Tensor grad_output, torch::Tensor input);
 torch::Tensor areno_linear_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, bool use_bias);
-torch::Tensor areno_e4m3_linear_forward_cuda(torch::Tensor input, torch::Tensor w_u8, torch::Tensor scale, c10::optional<torch::Tensor> out);
 std::vector<torch::Tensor> areno_linear_backward_cuda(
     torch::Tensor grad_output,
     torch::Tensor input,
@@ -200,8 +199,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("areno_d_sigmoid", &areno_d_sigmoid_cuda, "ARENO sigmoid backward");
   m.def("areno_d_softplus", &areno_d_softplus_cuda, "ARENO softplus backward");
   m.def("areno_linear_forward", &areno_linear_forward_cuda, "ARENO linear forward");
-  m.def("areno_e4m3_linear_forward", &areno_e4m3_linear_forward_cuda, "ARENO E4M3 fused dequant-linear forward",
-        pybind11::arg("input"), pybind11::arg("w_u8"), pybind11::arg("scale"), pybind11::arg("out") = pybind11::none());
   m.def("areno_linear_backward", &areno_linear_backward_cuda, "ARENO linear backward");
   m.def("areno_causal_attention_forward", &areno_causal_attention_forward_cuda, "ARENO causal attention forward");
   m.def("areno_causal_attention_backward", &areno_causal_attention_backward_cuda, "ARENO causal attention backward");
