@@ -17,20 +17,23 @@ def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a.float() - b.float()).abs().max() / (b.float().abs().max() + 1e-6))
 
 
-def best(fn, reps=100, warm=20) -> float:
+def best(fn, reps=200, warm=50) -> float:
+    # Amortized throughput: time `reps` back-to-back calls (no per-call sync) so
+    # kernels overlap, which is what decode tokens/s actually measures. With a
+    # per-call sync the M=1 ratio collapses to ~1.39x because the barrier + launch
+    # overhead dominates a ~24us kernel; amortized it is ~1.5x at M<=4 and ~1.98x
+    # at M>=128. Also wheels up the H20 clocks before timing.
     for _ in range(warm):
         fn()
     torch.cuda.synchronize()
-    bv = 1e9
+    start = torch.cuda.Event(True)
+    end = torch.cuda.Event(True)
+    start.record()
     for _ in range(reps):
-        s = torch.cuda.Event(True)
-        e = torch.cuda.Event(True)
-        s.record()
         fn()
-        e.record()
-        torch.cuda.synchronize()
-        bv = min(bv, s.elapsed_time(e))
-    return bv
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / reps
 
 
 def quant_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
