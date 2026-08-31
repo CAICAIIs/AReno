@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import torch
 
-from areno.accel._extension import extension as _extension
-
 
 def quantized_e4m3_linear_cuda(
     x: torch.Tensor,
@@ -46,6 +44,8 @@ def quantized_e4m3_linear_cuda(
     s2 = scale.contiguous()
     # Pass the caller's buffer through so the extension writes into it directly and
     # the hot decode path avoids a per-call torch::empty + copy_.
+    from areno.accel._extension import extension as _extension
+
     return _extension().areno_e4m3_linear_forward(x2, w2, s2, out)
 
 

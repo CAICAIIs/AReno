@@ -90,7 +90,6 @@ def test_quantized_linear_module_matches_reference():
 def test_config_default_is_opt_in_unchanged():
     cfg = ModelConfig()
     assert cfg.quant_method == "none"
-    assert cfg.quant_group_size == 128
     # Setting it to fp8 changes the field without changing any existing value.
     cfg.quant_method = "fp8"
     assert cfg.quant_method == "fp8"

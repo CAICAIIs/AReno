@@ -26,18 +26,19 @@ import torch
 _FP8_E4M3_MAX = 448.0
 
 
-def compute_fp8_scale(weight: torch.Tensor, group_size: int = -1) -> torch.Tensor:
+def compute_fp8_scale(weight: torch.Tensor, group_size: int = -1, max_val: float = _FP8_E4M3_MAX) -> torch.Tensor:
     """Compute the FP8 scale for `weight`, per-tensor or per-group.
 
     ``group_size <= 0`` (default) uses a single per-tensor scale. Otherwise the
     weight's last dim is split into groups of ``group_size`` and a scale is
-    computed per group. Scale is chosen so the max magnitude in the group maps
-    to ``_FP8_E4M3_MAX``; a zero group falls back to 1.0 to avoid inf/nan.
+    computed per group. ``max_val`` is the grid's largest finite magnitude (448
+    for E4M3, 57344 for E5M2). Scale is chosen so the max magnitude in the group
+    maps to ``max_val``; a zero group falls back to 1.0 to avoid inf/nan.
     """
     w = weight.detach().float()
     if group_size is None or group_size <= 0:
         amax = w.abs().amax()
-        scale = amax / _FP8_E4M3_MAX
+        scale = amax / max_val
         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
         return scale
     n = w.numel()
@@ -46,7 +47,7 @@ def compute_fp8_scale(weight: torch.Tensor, group_size: int = -1) -> torch.Tenso
         raise ValueError(f"weight numel {n} must be divisible by group_size {g}")
     flat = w.reshape(-1, g)
     amax = flat.abs().amax(dim=1, keepdim=True)
-    scale = amax / _FP8_E4M3_MAX
+    scale = amax / max_val
     scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     return scale.reshape(-1)
 

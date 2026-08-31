@@ -116,19 +116,20 @@ def dequantize_fp8_weight(w_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Ten
     return (w_fp8.float() * scale.to(torch.float32)).to(torch.bfloat16)
 
 
-def mark_fp8_weight(weight: torch.Tensor, *, group_size: int = -1, fp8_dtype=torch.float8_e5m2) -> torch.Tensor:
+def mark_fp8_weight(weight: torch.Tensor, *, fp8_dtype=torch.float8_e5m2) -> torch.Tensor:
     """Quantize a bf16 weight in place and stash the FP8 payload for the linear hook.
 
     Sets ``weight._areno_fp8`` (FP8 grid tensor) and ``weight._areno_fp8_scale``
     (per-tensor scale) so ``_areno_linear_forward`` dispatches to
-    :func:`quantized_fp8_linear`. Returns ``weight``. ``group_size <= 0`` means a
-    single per-tensor scale (the current kernel path).
+    :func:`quantized_fp8_linear`. Returns ``weight``. Per-tensor scale only (the
+    kernel reads a single scalar); reuse the shared scale helper from
+    ``areno.engine.quantization``.
     """
-    f = weight.detach().float()
+    from areno.engine.quantization import compute_fp8_scale
+
     max_v = 57344.0 if fp8_dtype is torch.float8_e5m2 else 448.0
-    scale = (f.abs().amax() / max_v).to(torch.float32).reshape(())
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    q = (f / scale).clamp(-max_v, max_v).to(fp8_dtype)
-    weight._areno_fp8 = q
+    f = weight.detach().float()
+    scale = compute_fp8_scale(f, max_val=max_v)
+    weight._areno_fp8 = (f / scale).clamp(-max_v, max_v).to(fp8_dtype)
     weight._areno_fp8_scale = scale
     return weight

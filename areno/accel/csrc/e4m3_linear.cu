@@ -60,7 +60,7 @@ __device__ __forceinline__ float e4m3_to_float(uint8_t b) {
   // bias 127 with bf16, so the normal case is just fp32_exp = e-7+127 = e+120 and
   // the 3 mantissa bits placed at the top of fp32's 23-bit mantissa (<<20).
   // Subnormal (e==0) and the NaN pattern (e==15,m==7) are handled with cheap
-  // selects. This avoids exp2f (measured ~2x faster than exp2f decode, ~815 GB/s).
+  // selects, avoiding exp2f in the hot decode loop.
   const uint32_t s = (b >> 7) & 1;
   const uint32_t e = (b >> 3) & 0xF;
   const uint32_t m = b & 0x7;
@@ -189,8 +189,8 @@ __global__ void e4m3_linear_kernel(
 // Small-M / memory-bound decode path. Each warp owns one output row `n` and
 // streams w[n,:] with 32-byte-coalesced reads along the contiguous k dim, reusing
 // the (kM x K) activation staged in shared, then warp-reduces with shuffles. This
-// avoids the tensor-core GEMM's M-waste and register pressure that capped it at
-// ~60 GB/s for the tiny-M decode case. kM is the batch of rows (== M).
+// avoids the tensor-core GEMM's M-waste and register pressure on tiny M. kM is
+// the batch of rows (== M).
 constexpr int kWarps = 8;         // warps per block -> 256 threads
 constexpr int kGemvThreads = kWarps * 32;
 constexpr int kGemvMaxM = 4;      // small-M decode path; larger M uses the WMMA GEMM fallback
@@ -280,10 +280,9 @@ __global__ void e4m3_gemv_kernel(
 
 }  // namespace areno_accel
 
-// Launch the small-M GEMV (direct-load kernel). No cudaFuncSetAttribute here:
-// the float-xs (M<=2) and bf16-xs (M>=3) gemv shared sizes are all < 48 KB, so
-// the default dynamic-shared limit suffices (calling cudaFuncSetAttribute on
-// every launch measurably slowed the fast M=1 kernel).
+// Launch the small-M GEMV (direct-load kernel). No cudaFuncSetAttribute: the
+// float-xs (M<=2) and bf16-xs (M>=3) shared sizes are all < 48 KB, so the
+// default dynamic-shared limit suffices.
 template <typename T, int kM, bool kFloatXs>
 void areno_launch_e4m3_gemv(
     const T* x,

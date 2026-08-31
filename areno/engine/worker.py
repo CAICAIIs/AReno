@@ -72,15 +72,14 @@ class ArenoWorker:
         self.model = build_model_on_device(config, self.device)
         if config.model_path is not None and not config.dummy_load:
             load_model_weights(self.model, config.model, config.model_path)
-        if config.model.quant_method == "fp8" or os.environ.get("ARENO_QUANT_FP8"):
-            # Decode-only FP8 quantization (RFC 0001): the FP8 W8A16 kernel has no
-            # backward, so it cannot update a model in a training step. Guard against
-            # silently running a train loop with zero gradient.
+        if config.model.quant_method == "fp8" or os.getenv("ARENO_QUANT_FP8", "0") in {"1", "true", "True", "yes"}:
+            # Decode-only FP8 (RFC 0001): the W8A16 kernel has no backward, so a train
+            # worker would silently accumulate zero gradient. Guard against that.
             if config.role == "train":
                 raise RuntimeError(
                     "quant_method='fp8' (decode-only) cannot be used in a train worker: "
                     "the FP8 kernel has no backward. Use quant_method='none' for training "
-                    "or run the rollout/inference role."
+                    "or run a rollout (decode) worker instead."
                 )
             quantize_model_weights_fp8(self.model)
         configure_multimodal_training(self.model, config.optimizer, trainable=config.role == "train")
