@@ -15,7 +15,7 @@ import multiprocessing as mp
 import queue
 import threading
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from itertools import count
 from typing import Any, Literal
@@ -723,12 +723,12 @@ def start_partitioned_clusters(
     clusters = (train_cluster, rollout_cluster)
     if train_cluster.world_spec != world_spec or rollout_cluster.world_spec != world_spec:
         raise ValueError("both clusters must use the supplied world_spec")
-    # One coordinator-held store for the combined train + rollout world; the
-    # resolved port replaces the placeholder in the shared world_spec before
-    # any worker spawns (see #517).
+    # One coordinator-held store serves the combined world; the resolved port
+    # is rebuilt into the frozen world_spec before any worker spawns (#517).
     store = _create_rendezvous_store(world_spec.master_addr, world_spec.global_world_size)
-    world_spec.master_port = int(store.port)
+    resolved_spec = replace(world_spec, master_port=int(store.port))
     for cluster in clusters:
+        cluster.world_spec = resolved_spec
         cluster._rendezvous_store = store
     try:
         for cluster in clusters:

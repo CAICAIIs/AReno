@@ -176,3 +176,78 @@ def test_rendezvous_store_resolves_and_holds_its_port() -> None:
     client = dist.TCPStore("127.0.0.1", port, world_size=2, is_master=False)
     store.set("k", "v")
     assert client.get("k") == b"v"
+
+
+def test_start_partitioned_clusters_resolves_frozen_world_spec() -> None:
+    """`start_partitioned_clusters` must fill in the resolved rendezvous port
+    without mutating the frozen `world_spec`.
+
+    `DistributedWorldSpec` is ``dataclass(frozen=True)``, so assigning
+    ``world_spec.master_port`` raises ``FrozenInstanceError``. The
+    coordinator-held store's resolved port is instead carried into a rebuilt
+    spec before any worker spawns (see #517).
+    """
+
+    from areno.engine.protocol import (
+        ClusterPartition,
+        DistributedWorldSpec,
+        start_partitioned_clusters,
+    )
+
+    class FakeCluster:
+        """Stand-in for TPCluster exposing exactly what the helper touches."""
+
+        def __init__(self, partition):
+            self.world_spec = None
+            self.partition = partition
+            self._rendezvous_store = None
+            self.started = False
+
+        def _spawn_workers(self) -> None:
+            pass
+
+        def _wait_for_worker_ready(self, ranks) -> None:
+            pass
+
+        def _abort_start(self) -> None:
+            pass
+
+        def _start_result_pump(self) -> None:
+            pass
+
+    # Mirror backend.py: a placeholder port that the helper must resolve.
+    world_spec = DistributedWorldSpec(
+        master_addr="127.0.0.1",
+        master_port=0,
+        global_world_size=4,
+        train=ClusterPartition(
+            role="train",
+            global_rank_offset=0,
+            local_world_size=2,
+            tp_size=2,
+            devices=(0, 1),
+        ),
+        rollout=ClusterPartition(
+            role="rollout",
+            global_rank_offset=2,
+            local_world_size=2,
+            tp_size=2,
+            devices=(2, 3),
+        ),
+    )
+    train = FakeCluster(world_spec.train)
+    rollout = FakeCluster(world_spec.rollout)
+    train.world_spec = world_spec
+    rollout.world_spec = world_spec
+
+    start_partitioned_clusters(train, rollout, world_spec)
+
+    # The shared world_spec's port is resolved and both partitions agree.
+    assert train.started and rollout.started
+    assert train.world_spec is rollout.world_spec
+    assert train.world_spec.master_port > 0
+    assert train.world_spec.master_port == rollout.world_spec.master_port
+    # The coordinator store is retained on every cluster.
+    assert train._rendezvous_store is rollout._rendezvous_store
+    # The frozen input spec must not have been mutated in place.
+    assert world_spec.master_port == 0
