@@ -1,11 +1,10 @@
-"""CPU tests for FP8 weight quantization (W8A16).
+"""CPU tests for FP8 weight quantization.
 
 These run without a GPU: the quantize/dequant math is implemented on float
-tensors and the `QuantizedLinear` module is a reference W8A16 dequant-forward
-module. They assert:
+tensors. They assert:
   * dequant(quantize(w)) is within FP8 tolerance of w,
   * a dequantized weight matmul is close to the bf16 linear,
-  * the `QuantizedLinear` module reproduces the reference linear,
+  * scales are finite/nonzero (including the zero-weight case),
   * the config default is opt-in unchanged (quant_method == "none").
 """
 
@@ -69,22 +68,6 @@ def test_scales_nonzero_and_finite():
     zero = torch.zeros(8, 8)
     scale0 = compute_fp8_scale(zero, group_size=-1)
     assert torch.isfinite(scale0).all() and scale0.item() > 0
-
-
-def test_quantized_linear_module_matches_reference():
-    from areno.engine.layers.linear import QuantizedLinear
-
-    out_feat, in_feat = 32, 48
-    ql = QuantizedLinear(in_feat, out_feat, group_size=-1, dtype=torch.bfloat16)
-    with torch.no_grad():
-        w = _weights((out_feat, in_feat))
-        ql.weight.copy_(w)
-        ql._requantize()
-        x = torch.randn(2, in_feat, dtype=torch.bfloat16)
-        out = ql(x)
-        ref = torch.nn.functional.linear(x, w.to(torch.bfloat16))
-        rel = float((out.float() - ref.float()).abs().max() / (ref.float().abs().max() + 1e-6))
-        assert rel < 0.2, f"QuantizedLinear rel err too high: {rel}"
 
 
 def test_config_default_is_opt_in_unchanged():

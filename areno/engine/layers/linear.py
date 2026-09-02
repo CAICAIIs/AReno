@@ -44,46 +44,6 @@ def mark_tensor_parallel_parameter(
         setattr(param, "tp_grad_allreduce", tp_grad_allreduce)
 
 
-class QuantizedLinear(nn.Module):
-    """W8A16 FP8 dequant-forward reference module.
-
-    Quantizes its bf16 weight to FP8 on demand and runs a dequant-forward matmul
-    (``x @ dequant(w_q)^T``), so the exact FP8 scale semantics are testable on CPU.
-    This is the correctness reference for the fused FP8 dequant-linear kernels;
-    the production decode path uses the areno.accel kernels / ``_areno_linear_forward``
-    directly. FP8 (E4M3/E5M2) has no backward, so this is a decode-only reference.
-    """
-
-    def __init__(
-        self, in_features: int, out_features: int, *, group_size: int = -1, dtype: torch.dtype = torch.bfloat16
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.group_size = group_size
-        self.dtype = dtype
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
-        self._q = None  # FP8 weight (fp8 grid or snapped float)
-        self._scale = None
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-
-    def _requantize(self) -> None:
-        from areno.engine.quantization import quantize_to_fp8
-
-        self._q, self._scale = quantize_to_fp8(self.weight.data, self.group_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from areno.engine.quantization import dequant_fp8
-
-        if self._q is None:
-            self._requantize()
-        dq = dequant_fp8(self._q, self._scale, self.group_size).to(self.dtype)
-        return F.linear(x, dq)
-
-
 def _shard_range(size: int, rank: int, world_size: int) -> tuple[int, int]:
     """Compute ``[start, end)`` of the local shard for an even partition."""
 
@@ -332,33 +292,27 @@ class RowParallelLinear(nn.Module):
 def _areno_linear_forward(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """Single entry point so all parallel linears share the areno.accel matmul."""
 
-    # FP8 path: a weight carrying an FP8 payload (weight._areno_fp8 +
-    # weight._areno_fp8_scale) routes through the W8A16 dequant-linear. Prefer
-    # torch._scaled_mm (A8W8) on Hopper — the decode fast path, ~2x and more
-    # accurate than Triton — and fall back to the Triton kernel elsewhere. Opt-in
-    # and backward-compatible: unmarked weights take the existing path.
+    # FP8 path (H20/Hopper): a weight carrying an FP8 payload (weight._areno_fp8 +
+    # weight._areno_fp8_scale) routes through the A8W8 torch._scaled_mm decode
+    # matmul. torch._scaled_mm is A8W8-only and needs cc >= 8.9, so elsewhere
+    # fp8-marked weights fall through to the existing bf16 path. Opt-in and
+    # backward-compatible: unmarked weights take the existing path.
     fp8 = getattr(weight, "_areno_fp8", None)
     if fp8 is not None:
-        scale = weight._areno_fp8_scale
-        from areno.accel.kernels.fp8_linear import (
-            quantized_fp8_linear,
-            quantized_fp8_scaled_mm,
-            scaled_mm_available,
-        )
+        from areno.accel.kernels.fp8_linear import quantized_fp8_scaled_mm, scaled_mm_available
 
-        # Decode/prefill may hand a 3-D (1, seq, hidden) activation; flatten to 2-D
-        # for the kernel then restore the leading dims.
-        out_ndim = x.ndim
-        xx = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
         if scaled_mm_available():
+            scale = weight._areno_fp8_scale
+            # Decode/prefill may hand a 3-D (1, seq, hidden) activation; flatten to
+            # 2-D for the kernel then restore the leading dims.
+            out_ndim = x.ndim
+            xx = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
             out = quantized_fp8_scaled_mm(xx, fp8, scale)
-        else:
-            out = quantized_fp8_linear(xx, fp8, scale)
-        if bias is not None:
-            out = out + bias
-        if out_ndim > 2:
-            out = out.reshape(*x.shape[:-1], out.shape[-1])
-        return out
+            if bias is not None:
+                out = out + bias
+            if out_ndim > 2:
+                out = out.reshape(*x.shape[:-1], out.shape[-1])
+            return out
 
     if x.ndim >= 3 and torch.is_grad_enabled():
         return F.linear(x, weight, bias)

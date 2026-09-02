@@ -24,9 +24,9 @@ def quantize_model_weights_fp8(model: torch.nn.Module) -> int:
     """Mark every TP-parallel linear weight as FP8 for the decode path.
 
     Calls ``mark_fp8_weight`` on the weight of each column/merged/row-parallel
-    linear so ``_areno_linear_forward`` routes those through the FP8 W8A16
-    decode path. Decode-only — the FP8 kernels have no backward, so this must not
-    be used in a training step. Returns the count.
+    linear so ``_areno_linear_forward`` routes those through the A8W8 FP8
+    decode path (Hopper). Decode-only — the FP8 kernels have no backward, so this
+    must not be used in a training step. Returns the count.
     """
     from areno.accel.kernels.fp8_linear import mark_fp8_weight
     from areno.engine.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
