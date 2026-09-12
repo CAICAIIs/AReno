@@ -14,8 +14,16 @@ from __future__ import annotations
 import torch
 
 from areno.accel import areno_linear
-from areno.accel.kernels.e4m3_cuda import quantize_weight_e4m3
 from areno.accel.kernels.fp8_scaled_mm import quantized_fp8_scaled_mm, scaled_mm_available
+
+
+def quantize_weight_e4m3(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor E4M3 quantize; matches areno.engine.quantization semantics."""
+    amax = w.abs().amax()
+    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax)).to(torch.float32)
+    q = (w.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return q, scale
+
 
 _SHAPES = [
     (1, 6144, 4096),  # qkv proj
