@@ -1787,9 +1787,9 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     type=click.Choice(["none", "fp8", "int4"]),
     default="none",
     show_default=True,
-    help="Decode-time weight quantization. fp8 quantizes rollout decode weights; "
-    "training math stays bf16. Requires an FP8-capable GPU (Hopper/Ada). "
-    "int4 is not implemented yet.",
+    help="Decode-time weight quantization. fp8 quantizes rollout decode weights, so rollout "
+    "logprobs (and PPO's importance ratio) come from quantized weights while the train step "
+    "stays bf16. Requires an FP8-capable GPU (Hopper/Ada). int4 is not implemented yet.",
 )
 @click.option(
     "--attn-backend",

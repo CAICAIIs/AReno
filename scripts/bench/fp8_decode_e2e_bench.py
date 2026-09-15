@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
+import threading
 import time
 
+from areno.accel.kernels.fp8_scaled_mm import scaled_mm_available
 from areno.engine import ArenoEngine
 from areno.engine.config import RuntimeConfig
 from areno.engine.data import SamplingParams
@@ -28,21 +31,23 @@ _BENCH_PROMPT = (
 )
 
 
-def _gpu_peak_mb(stop: dict, out: dict) -> None:
-    """Sample every GPU and keep the high-water mark (engine workers own the
-    memory, so the parent cannot use torch counters; index sampling breaks
-    under CUDA_VISIBLE_DEVICES remapping)."""
+def _gpu_peak_mb(stop: threading.Event, visible_devices: list[str]) -> int:
+    """Sample the devices this run owns and keep the high-water mark.
+
+    Engine workers own the memory, so the parent cannot use torch counters.
+    Sampling every device would report another tenant's usage as this run's
+    peak, so restrict the query to this process's visible devices.
+    """
+    query = ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"]
     peak = 0
-    while not stop["stop"]:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-        )
+    while not stop.is_set():
+        result = subprocess.run(query, capture_output=True, text=True)
         for line in result.stdout.strip().splitlines():
-            peak = max(peak, int(line))
+            index, used = (field.strip() for field in line.split(","))
+            if index in visible_devices:
+                peak = max(peak, int(used))
         time.sleep(0.05)
-    out["peak_mb"] = peak
+    return peak
 
 
 def _bench_loss_fn(*_: object) -> object:
@@ -62,6 +67,12 @@ def main() -> None:
     parser.add_argument("--attn-backend", choices=["native", "flash"], default="native")
     args = parser.parse_args()
 
+    if args.quant == "fp8" and not scaled_mm_available(args.device):
+        raise SystemExit(
+            f"--quant fp8 needs an FP8-capable device (compute capability >= 8.9); device {args.device} "
+            "reports otherwise, so the run would silently measure bf16"
+        )
+
     engine = ArenoEngine.from_pretrained(
         args.model,
         tp_size=args.tp,
@@ -76,11 +87,13 @@ def main() -> None:
         prompt_ids = tokenizer(_BENCH_PROMPT, add_special_tokens=True)["input_ids"]
         prompts = [prompt_ids for _ in range(args.batch)]
 
-        import threading
-
-        stop = {"stop": False}
-        gpu_peak: dict = {}
-        sampler = threading.Thread(target=_gpu_peak_mb, args=(stop, gpu_peak), daemon=True)
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        visible_devices = [entry for entry in visible_devices if entry] or [
+            str(args.device + offset) for offset in range(args.tp)
+        ]
+        stop = threading.Event()
+        peak_mb: list[int] = []
+        sampler = threading.Thread(target=lambda: peak_mb.append(_gpu_peak_mb(stop, visible_devices)), daemon=True)
         sampler.start()
 
         engine.begin_rollout_session()
@@ -111,7 +124,7 @@ def main() -> None:
                     "tokens_per_s": round(tokens / elapsed, 1),
                 }
             )
-        stop["stop"] = True
+        stop.set()
         sampler.join(timeout=2)
         engine.end_rollout_session()
 
@@ -121,6 +134,7 @@ def main() -> None:
             json.dumps(
                 {
                     "quant": args.quant,
+                    "quant_effective": "fp8" if args.quant == "fp8" else "bf16",
                     "model": args.model,
                     "tp": args.tp,
                     "batch": args.batch,
@@ -129,7 +143,7 @@ def main() -> None:
                     "warmup_tokens": generated,
                     "runs": results,
                     "aggregate_tokens_per_s": round(total_tokens / total_time, 1),
-                    "peak_gpu_mem_mb": gpu_peak.get("peak_mb"),
+                    "peak_gpu_mem_mb": peak_mb[0] if peak_mb else None,
                     "sample_text": tokenizer.decode(out.response_ids[0][:40]),
                 }
             )

@@ -1006,8 +1006,9 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str]:
     type=click.Choice(["none", "fp8"]),
     default="none",
     show_default=True,
-    help="Decode-time weight quantization. fp8 quantizes linear weights for decode; "
-    "requires an FP8-capable GPU (Hopper/Ada), otherwise decode stays full precision.",
+    help="Decode-time weight quantization. fp8 quantizes parallel-linear weights inside a "
+    "decode session, so scoring and training stay bf16; it requires an FP8-capable GPU "
+    "(Hopper/Ada), otherwise decode stays full precision.",
 )
 @click.option(
     "--disable-thinking",

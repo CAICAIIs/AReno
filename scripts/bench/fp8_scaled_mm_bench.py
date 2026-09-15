@@ -1,10 +1,9 @@
-"""GPU bench + correctness for the Hopper FP8 decode-linear (torch._scaled_mm).
+"""GPU bench + correctness for the FP8 decode-linear (torch._scaled_mm).
 
-Validates the integrated A8W8 path (``quantized_fp8_scaled_mm`` over the uint8
-E4M3 payload) against the bf16 reference, then times it vs the bf16
-``areno_linear`` cuBLAS path at Qwen3-8B shapes under CUDA-graph replay —
-decode runs under graphs, and without them launch overhead hides the win at
-small M. Requires Hopper/Ada (cc >= 8.9):
+Validates the A8W8 path over the shipped E4M3 payload against a bf16 reference,
+then times it against the bf16 areno_linear cuBLAS path at Qwen3-8B shapes under
+CUDA-graph replay: decode runs under graphs, and without them launch overhead
+hides the win at small M. Requires Hopper/Ada (cc >= 8.9):
 
     CUDA_VISIBLE_DEVICES=0 python scripts/bench/fp8_scaled_mm_bench.py
 """
@@ -15,15 +14,7 @@ import torch
 
 from areno.accel import areno_linear
 from areno.accel.kernels.fp8_scaled_mm import quantized_fp8_scaled_mm, scaled_mm_available
-
-
-def quantize_weight_e4m3(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-tensor E4M3 quantize; matches areno.engine.quantization semantics."""
-    amax = w.abs().amax()
-    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax)).to(torch.float32)
-    q = (w.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    return q, scale
-
+from areno.engine.quantization import quantize_weight_fp8
 
 _SHAPES = [
     (1, 6144, 4096),  # qkv proj
@@ -64,14 +55,14 @@ def bench_graphed(fn, reps: int = 200, warm: int = 50) -> float:
 
 def main() -> None:
     torch.manual_seed(0)
-    if not scaled_mm_available():
+    if not scaled_mm_available(torch.cuda.current_device()):
         raise RuntimeError("torch._scaled_mm (FP8 A8W8) requires Hopper/Ada (cc >= 8.9); this bench is Hopper-only")
 
     print("=== correctness vs bf16 reference ===")
     for M, N, K in [(1, 4096, 4096), (4, 24576, 4096)]:
         x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
         w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * (4.0 / (K**0.5))
-        w_u8, scale = quantize_weight_e4m3(w)
+        w_u8, scale = quantize_weight_fp8(w)
         out = quantized_fp8_scaled_mm(x, w_u8, scale)
         ref = x @ w.T
         print(
@@ -84,7 +75,7 @@ def main() -> None:
     for M, N, K in _SHAPES:
         x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
         w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * (4.0 / (K**0.5))
-        w_u8, scale = quantize_weight_e4m3(w)
+        w_u8, scale = quantize_weight_fp8(w)
         ybuf = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
 
         def bf16_call():

@@ -75,7 +75,7 @@ class TrainerConfig:
     optimizer_state_offload_batch_size: int = 1
     eager_decode: bool = False
     attn_backend: str = "flash"
-    quant_method: str = "none"
+    quant_method: Literal["none", "fp8", "int4"] = "none"
     metrics_log_dir: str | None = DEFAULT_METRICS_LOG_DIR
     agent_fn: str | None = None
     train_tool_results: bool = False
